@@ -1,6 +1,8 @@
 # MilanoR2019
 MilanoR Meetup, June 25, 2019.
 
+![Graph](/img/dk_graph.png)
+
 The Rmarkdown notebooks in this repository accompany the MilanoR Meetup, 25 June 2019:
 
 Information Retrieval: 
