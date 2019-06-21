@@ -1,0 +1,444 @@
+---
+title: Semantic Web Technologies and Wikidata from R
+author:
+- name: Goran S. Milovanović
+  affiliation: Wikimedia Deutschland, Data Scientist, DataKolektiv, Owner
+- name: Mike Page
+  affiliation: DataKolektiv, Junior Data Scientist
+date: "`r format(Sys.time(), '%d %B %Y')`"
+abstract: 
+output:
+  html_notebook:
+    code_folding: show
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+  html_document:
+    toc: yes
+    toc_depth: 5
+---
+
+![](img/DK_Logo_100.png)
+
+***
+### Notebook 02: Wikidata Entity Matching w. {WikidataR} search
+**Feedback** should be send to `goran.milovanovic@datakolektiv.com`. 
+These notebooks accompany the MilanoR talk 2019/06/25.
+
+***
+
+### 0. Install {WikidataR}
+
+This is the package GitHUb page: [https://github.com/Ironholds/WikidataR](https://github.com/Ironholds/WikidataR). 
+Vignette: [https://cran.r-project.org/web/packages/WikidataR/vignettes/Introduction.html](https://cran.r-project.org/web/packages/WikidataR/vignettes/Introduction.html)
+All you need is `install.packages("WikidataR")` or `devtools::install_github("ironholds/WikidataR")` for the dev version.
+
+### 1. Setup
+
+**Note.** The following chunks load packages, define the project directory tree and some constants.
+
+```{r echo = T, message = F}
+## - libraries
+library(data.table)
+library(tidyverse)
+library(WikidataR)
+library(httr)
+library(jsonlite)
+library(rvest)
+library(stringr)
+
+## - directories
+dataDir <- 'data/'
+analyticsDir <- 'analytics/'
+funDir <- 'functions/'
+```
+
+
+### 2. Load `entity_frame` and prepare for Wikidata search
+
+**Note.** The following chunks load the `content_corpus` and `entity_frame`, and perform some clean-ups:
+
+* every recognized entity that starts with an article (`the|a`) is transformed by removing the article;
+* entities of `nchar(entity) == 1` are removed; we don't wish to try to disambiguate the meaning of single letters.
+
+```{r echo = T}
+### --- data
+# - load entities_frame
+entities_frame <- fread(paste0(analyticsDir, 
+                               "entities_frame_01_spaCy_NER.csv"))
+entities_frame$V1 <- NULL
+# - load content_corpus_stats.csv
+content_corpus_stats <- fread(paste0(analyticsDir,
+                                     "content_corpus_stats.csv"))
+content_corpus_stats$V1 <- NULL
+content_corpus_stats <- as.list(content_corpus_stats)
+
+### --- Prepare entities_frame$text for Wikidata search
+entities_frame$searchText <- gsub("^the|^a ", "", entities_frame$text, 
+                                  ignore.case = T)
+entities_frame$searchText <- str_trim(entities_frame$searchText, 
+                                      side = "both")
+# - we will not try to disambiguate a single letter or two letter abbreviations:
+entities_frame <- entities_frame[which(nchar(entities_frame$searchText) > 2), ]
+
+```
+
+### 3. {WikidataR} search for our entities
+
+**Note.** We make use of `WikidataR::find_item(x)` in order to fetch all Wikidata entities that match a particular search string from the `entity_frame$searchText` field. We are looking for a `grepl()` regex match across the Wikidata labels and aliases and keep everything we find. Since this procedure takes a significant amount of time to run, we are not evaluating the following code chunk, but rather load the `wd_search` dataframe - after all the search procedures are finished.
+
+```{r echo = T, eval = F}
+### --- Search for recognized entities in Wikidata
+# - use {WikidataR} search function: WikidataR::find_item(x) --> wd_search
+# - report:
+t1 <- Sys.time()
+print(paste0("Started {WikidataR} search: ", t1))
+wd_search <- lapply(unique(entities_frame$searchText), function(x) {
+  
+  # - WikidataR::find_item
+  repeat {
+    r <- tryCatch({WikidataR::find_item(x)
+    }, 
+    error = function(condition) {
+      print("Curl error; wait 5 secs, try again.")
+      Sys.sleep(5)
+      WikidataR::find_item(x)
+    })
+    if (class(r) == "find_item") {
+      break
+    }
+  }
+  # - resulting labels
+  l <- sapply(r, function(y) {y$label})
+  l <- unname(sapply(l, function(x) {ifelse(is.null(x), NA, x)}))
+  # - resulting aliases
+  a <- sapply(r, function(y) {y$aliases})
+  a <- unlist(sapply(a, function(x) {ifelse(is.null(x), NA, x)}))
+  # - resulting concepts
+  c <- sapply(r, function(y) {y$concepturi})
+  # - resulting descriptions
+  d <- sapply(r, function(y) {y$description})
+  d <- unname(unlist(sapply(d, function(x) {ifelse(is.null(x), NA, x)})))
+  
+  # - search through labels and aliases
+  # - for an EXACT MATCH
+  # - [NOTE ]MikeP: e.g. we are missing to pick up United States from: "US"
+  # - [NOTE ]MikeP: please improve this procedure if possible
+  # - [NOTE ]MikeP: should we go for an exact match, or do something fuzzy?
+  lSearch <- grepl(tolower(x),  tolower(l), fixed = T)
+  lSearch[is.na(lSearch)] <- F
+  aSearch <- grepl(tolower(x), tolower(a), fixed = T)
+  aSearch[is.na(aSearch)] <- F
+  search <- which(lSearch + aSearch >= 1)
+  
+  # - if x in labels and aliases
+  if (length(search) > 0) {
+    return(
+      data.frame(
+        searchText = x,
+        label = l[search],
+        alias = a[search],
+        description = d[search],
+        uri = c[search],
+        stringsAsFactors = F))
+    # - else: it is missing...
+  } else {
+    return(data.frame(
+      searchText = x,
+      label = NA,
+      alias = NA,
+      description = NA,
+      uri = NA,
+      stringsAsFactors = F))
+  }
+  
+})
+# - collect results:
+wd_search <- rbindlist(wd_search)
+
+# - remove every entry in wd_search where concept uri
+# - is absent:
+wd_search <- dplyr::filter(wd_search, 
+                           !is.na(uri))
+# - remove duplicated concept URIs
+w <- which(duplicated(wd_search$uri))
+if (length(w) > 0) {
+  wd_search <- wd_search[-w, ]
+}
+# - report:
+t2 <- Sys.time()
+print(paste0("Ended {WikidataR} search: ", t2))
+print(paste0("WikidataR search took: ", t2 - t1))
+
+# - prepare the wd_search$uri field:
+wd_search$uri <- gsub("http://www.wikidata.org/entity/", "", wd_search$uri)
+
+# - store collectedClasses
+write.csv(wd_search, 
+          paste0(analyticsDir, "wd_search.csv"))
+```
+
+### 4. SPARQL: fetch all P31 (instance of)/P279 (subclass of) classes of the collected Wikidata entities
+
+**Note.** The `entity_frame` data.frame is still where we will track all recognized entities alongside the `doc_Id` of the respective document from the `content_corpus`. The `searchText` field in this dataframe contains the exact search query that was used to match a spaCy recognized named entity against Wikidata, while the discovered entities themselves are found in the `wd_search` dataframe. Obviously, the Wikidata to entities matching is many-to-one, and we will need to perform some sort of Word Disambiguation in order to determine what Wikidata exactly matches which spaCy entity. In that respect, in the next step we aim to collect all `P31` (`instance of`)/`P279` (`subclass of`), and use them as an additional filter.
+Again, because this procedure takes a significant amount of time to run, we are not evaluating the following code chunk, but rather load the `wd_search` and the `collectedClasses` dataframes (obtained from the following chunk) once they are produced by the respective procedures.
+The following code chunk uses [SPARQL](https://www.w3.org/TR/rdf-sparql-query/) to collect information from the Wikidata knowledge base. Wikidata has a nice [SPARQL Tutorial](https://www.wikidata.org/wiki/Wikidata:SPARQL_tutorial) accompanyed by a large number of [examples](https://www.wikidata.org/wiki/Wikidata:SPARQL_query_service/queries/examples) to learn from. We will be accessing Wikidata via its SPARQL endpoint: [the Wikidata Query Service (WDQS)](https://query.wikidata.org/). To learn more about WDQS: read the [user manual](https://www.mediawiki.org/wiki/Wikidata_Query_Service/User_Manual).
+
+
+```{r echo = T, eval = F}
+# - load wd_search
+wd_search <- read.csv(paste0(analyticsDir, "wd_search.csv"),
+                      header = T,
+                      check.names = F,
+                      row.names = 1,
+                      stringsAsFactors = F)
+
+# - how many concepts?
+n_concepts <- length(unique(wd_search$uri))
+
+# - WDQS endPoint:
+endPointURL <- "https://query.wikidata.org/bigdata/namespace/wdq/sparql?format=json&query="
+
+# - collectedClasses
+collectedClasses <- vector(mode = "list", 
+                           length = n_concepts)
+
+# - report:
+t1 <- Sys.time()
+print(paste0("Started SPARQL for classes: ", t1))
+
+# - iterate: fetch all WD classes to which concept_uris belong to
+for (i in 1:length(wd_search$uri)) {
+  
+  # - to runtime Log:
+  # print(paste0("--- SPARQL query:", i, "/", n_concepts, " : ", wd_search$uri[i]))
+  
+  # - query
+  query <- paste0('SELECT ?class ?classLabel 
+                    WHERE 
+                      {wd:', wd_search$uri[i], ' wdt:P31/wdt:P279* ?class.
+                        SERVICE wikibase:label { bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en". }
+                      }')
+  
+  # - init repeat counter
+  c <- 0
+  
+  # - run query
+  repeat {
+    
+    # - run query:
+    repeat{
+      res <- tryCatch(
+        {GET(url = paste0(endPointURL, URLencode(query)))},
+        warning = function(cond) {
+          # - return error:
+          print(paste("Error on GET: ", i, " failed w. warning; repeating.", (c <- c + 1), sep = ""))
+          Sys.sleep(1)
+          'warning'
+        }, 
+        error = function(cond) {
+          # - return error:
+          print(paste("Error now GET: ", i, " failed w. error; repeating.", (c <- c + 1), sep = ""))
+          Sys.sleep(1)
+          
+          'error'
+        })
+      if (class(res) == "response") {
+        break
+      }
+    }
+    
+    # - check query:
+    if (res$status_code != 200) {
+      # - to runtime Log:
+      print(paste("Server response not 200 for concept: ", i, "; repeating.", (c <- c + 1),sep = ""))
+      rc <- 'error'
+    } else {
+      # - JSON:
+      rc <- rawToChar(res$content)
+      rc <- tryCatch(
+        {
+          # - fromJSON:
+          fromJSON(rc, simplifyDataFrame = T)
+        },
+        warning = function(cond) {
+          # - return error:
+          # print(paste("Parsing now concept:", i, " failed w. warning; repeating.", (c <- c + 1), sep = ""))
+          'error'
+        }, 
+        error = function(cond) {
+          # - return error:
+          # print(paste("Parsing now concept:", i, " failed w. error; repeating.", (c <- c + 1), sep = ""))
+          'error'
+        }
+      )
+    }
+    
+    # - condition:
+    if (res$status_code == 200 & class(rc) == 'list') {
+      
+      # - clean:
+      rm(res); gc()
+      
+      # - extract:
+      class <- rc$results$bindings$class$value
+      class <- gsub("http://www.wikidata.org/entity/", "", class)
+      classLabel <- rc$results$bindings$classLabel$value
+      # - as.data.frame:
+      if (length(class) > 0) {
+        items <- data.frame(uri = wd_search$uri[i],
+                            class = paste(class, collapse = ", "),
+                            classLabel = paste(classLabel, collapse = ", "),
+                            stringsAsFactors = F)
+      } else {
+        items <- data.frame(uri = wd_search$uri[i],
+                            class = NA,
+                            classLabel = NA,
+                            stringsAsFactors = F)
+      }
+      # - clear:
+      rm(rc); gc()
+      # - keep unique result set:
+      w <- which(duplicated(items$class))
+      if (length(w) > 0) {items <- items[-w, ]}
+      # - clear possible NAs from classLabel
+      w <- which(is.na(items$classLabel))
+      if (length(w) > 0) {items$classLabel[w] <- items$class[w]}
+      # - assign:
+      collectedClasses[[i]] <- items
+      # - exit:
+      break
+    }
+    
+    print("Pause for 2 secs.")
+    Sys.sleep(2)
+    
+  }
+  # - next uri
+  
+}
+
+# - report:
+t2 <- Sys.time()
+print(paste0("Started SPARQL for classes: ", t2))
+print(paste0("SPARQL queries took: ", t2 - t1))
+
+# - collectedClasses
+collectedClasses <- rbindlist(collectedClasses)
+collectedClasses <- filter(collectedClasses, 
+                           !is.na(class))
+# - store collectedClasses
+write.csv(collectedClasses, 
+          paste0(analyticsDir, "collectedClasses.csv"))
+```
+
+### 5. Join `wd_search` with `collectedClasses`: all candidate Wikidata items to their respective P31 (instance of) and/or P279 (subclass of) classes
+
+**Note.** The `classInclude` constant describes by labels all of the Wikidata classes whose items we want to keep as candidates in entity meaning disambigutaion; the `classExlude`, on the other hand, describes those classes whose items we want to drop.
+
+```{r echo = T, eval = T}
+# - load collectedClasses and wd_search
+collectedClasses <- read.csv(paste0(analyticsDir,
+                                    "collectedClasses.csv"),
+                             header = T,
+                             check.names = F,
+                             row.names = 1,
+                             stringsAsFactors = F)
+wd_search <- read.csv(paste0(analyticsDir, "wd_search.csv"),
+                      header = T,
+                      check.names = F,
+                      row.names = 1,
+                      stringsAsFactors = F)
+
+# - join collectedClasses to wd_search by concept uri
+wd_search <- dplyr::left_join(wd_search, 
+                              collectedClasses,
+                              by = 'uri')
+# - filter wd_search for is.na(class) to keep
+# - only WD candidate items whose P31 and/or P279 classes are known
+wd_search <- dplyr::filter(wd_search, 
+                           !is.na(class))
+rm(collectedClasses)
+
+# - filter wd_search additionaly 
+# - by those Wikidata classes that conceptually match
+# - our original intentions:
+# - keep only items in the following selected
+# - categories:
+classesInclude <- c('product', 'company', 'business', 'political party', 'person', 
+                    'human', 'brand', 'type of business entity',
+                    'business', 'city', 'country', 'government organization', 
+                    'non-governmental organization', 'technique', 
+                    'profession', 'mass media', 'state')
+classesExclude <- c('MediaWiki page', 
+                    'Wikimedia page', 
+                    'Wikimedia page outside the main knowledge tree', 
+                    'Wikimedia internal item', 
+                    'MediaWiki main-namespace page', 
+                    'Wikimedia disambiguation page', 
+                    'historical country', 'fictional country', 'fictional human',
+                    'fictional character', 'sports organization', 'work of art')
+wd_search$match <- sapply(wd_search$classLabel, function(x) {
+  d <- strsplit(x, split = ", ")[[1]]
+  cI <- sum(d %in% classesInclude)
+  cE <- sum(d %in% classesExclude)
+  if (cI > 0 & cE == 0) {
+    return("match")
+  } else {
+    return("no match")
+  }
+})
+
+# - How many matches:
+table(wd_search$match)
+
+# - filter wd_search for match == 'match'
+wd_search <- dplyr::filter(wd_search, 
+                           match == 'match')
+wd_search$match <- NULL
+
+# - left_join wd_search to entities_frame
+# - by searchText
+entities_frame <- dplyr::left_join(entities_frame, wd_search,
+                                   by = "searchText")
+rm(wd_search)
+# - remove every entry in entities_frame where concept uri
+# - is absent:
+entities_frame <- dplyr::filter(entities_frame, 
+                                !is.na(uri))
+# - store entities_frame_02_WD_match.csv
+write.csv(entities_frame, 
+          paste0(analyticsDir, "entities_frame_02_WD_match.csv"))
+```
+
+**Example.** A subset of `entity_frame`:
+
+```{r echo = T}
+datatable((entities_frame[runif(20, 1, dim(entities_frame)[1]), ]))
+```
+
+### 6. Next steps 
+
+Finally, we have collected all Wikidata entities that act as candidates in the disambiguation of meaning of the spaCy recognized named entities. Alongisde the entities we have also collected the Wikidata classes to which they belong to. As demonstrated, the Wikidata class information can immediately act as an additional filter for our dataset (e.g. we are trying to disambiguate `Apple`, but we are certainly not looking for something belonging to the class of `Fruit`). 
+
+In our next Notebook - `03_ReferenceWikipediaCorpus.nb.html` - we also the Reference Corpus: a collection of all English Wikipedia pages for all Wikidata entities that will act as candidates in disambiguation. 
+
+***
+Goran S. Milovanović & Mike Page
+
+DataKolektiv, 2019.
+
+contact: datakolektiv@datakolektiv.com
+
+![](img/DK_Logo_100.png)
+
+***
+License: [GPLv3](http://www.gnu.org/licenses/gpl-3.0.txt)
+This Notebook is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+This Notebook is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+You should have received a copy of the GNU General Public License along with this Notebook. If not, see <http://www.gnu.org/licenses/>.
+
+***
+
+

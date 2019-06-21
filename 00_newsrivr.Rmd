@@ -1,0 +1,87 @@
+---
+title: Semantic Web Technologies and Wikidata from R
+author:
+- name: Goran S. Milovanović
+  affiliation: Wikimedia Deutschland, Data Scientist, DataKolektiv, Owner
+- name: Mike Page
+  affiliation: DataKolektiv, Junior Data Scientist
+date: "`r format(Sys.time(), '%d %B %Y')`"
+abstract: 
+output:
+  html_notebook:
+    code_folding: show
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+  html_document:
+    toc: yes
+    toc_depth: 5
+---
+
+![](img/DK_Logo_100.png)
+
+***
+### Notebook 00: retrieving news with {newsrivr}
+**Feedback** should be send to `goran.milovanovic@datakolektiv.com`. 
+These notebooks accompany the MilanoR talk 2019/06/25.  
+
+
+***
+
+### 0. Install newsrivr
+
+Install the development version of [newsrivr](https://github.com/datakolektiv/newsrivr) from GitHub.
+
+```{r, eval=FALSE}
+# install.packages("devtools")
+devtools::install_github("datakolektiv/newsrivr")
+```
+
+
+### 1. Setup
+
+**Note.** The following chunk loads packages and defines the project directory tree.
+
+```{r echo = T}
+## - libraries
+library(newsrivr)
+
+## - directories
+dataDir <- 'data/'
+```
+
+### 2. Store newsrivr credentials
+To access the Newsriver API, you must register for an API key at [newsriver.io](https://newsriver.io/). It is common practice to store API keys in your `.Renviron` file so they are available each time R is loaded. The newsrivr `store_creds()` function invokes this behaviour and prompts you for your API key (and user agent) and stores them in your `.Renviron` file in your home directory.
+
+If you do not want to alter your `.Renviron` file, you can use the newsrivr `store_creds_temp()` function to temporarily store your credentials for that session.
+
+```{r echo = T}
+# Store credentials in the .Renviron file located in the home dir
+# Provide a sensible user agent (e.g., contact email address)
+store_creds()
+```
+
+
+### Retrieve news, clean news, and then write to disk
+
+To retrieve news from the Newsriver API, use the newsrivr `get_news()` function. Currently, `get_news()` takes two arguments, `search_term_higher` and `search_term_lower`, which are keywords that are matched against the text and title of news articles (one being the capitalised version of the other). Currently, `get_news()` defaults to search for news articles from the past month. In the next iteration of the package, users will be able to search for articles across a range of search parameters and retrieve articles from the past year.
+
+Once news articles have been retrieved, they can be passed into the newsrivr `clean_news()` function which provides a set of sensible defaults and options. These defaults include removing unwanted metadata, filtering "junk" articles, removing duplicates, converting date strings to class "Date", transforming characters to lower case, and more!
+
+```{r echo = T, eval = F}
+# - write function that retrievs and cleans news and then saves
+# - to disk
+save_news <- function(query){
+  news <- get_news(query = query)
+  news <- clean_news(news) 
+  saveRDS(news, paste0(dataDir, tolower(query), ".rds"))
+}
+ 
+# - Iterate save_news() over list of companies
+save_news("Google")
+save_news("Facebook")
+save_news("Microsoft")
+save_news("Twitter")
+save_news("Apple")
+```

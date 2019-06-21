@@ -1,0 +1,240 @@
+---
+title: Semantic Web Technologies and Wikidata from R
+author:
+- name: Goran S. Milovanović
+  affiliation: Wikimedia Deutschland, Data Scientist, DataKolektiv, Owner
+- name: Mike Page
+  affiliation: DataKolektiv, Junior Data Scientist
+date: "`r format(Sys.time(), '%d %B %Y')`"
+abstract: 
+output:
+  html_notebook:
+    code_folding: show
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+  html_document:
+    toc: yes
+    toc_depth: 5
+---
+
+![](img/DK_Logo_100.png)
+
+***
+### Notebook 04: Reference Corpus: Preparation for Document-Level Disambiguation w. LDA
+**Feedback** should be send to `goran.milovanovic@datakolektiv.com`. 
+These notebooks accompany the MilanoR talk 2019/06/25.
+
+***
+
+### 1. Setup
+
+**Note.** The following chunks load packages, define the project directory tree and some constants.
+
+```{r echo = T, message = F}
+### --- setup
+## - libraries
+library(data.table)
+library(tidyverse)
+library(stringr)
+library(tm)
+library(BBmisc)
+library(text2vec)
+
+## - directories
+dataDir <- 'data/'
+analyticsDir <- 'analytics/'
+funDir <- 'functions/'
+```
+
+
+### 2. Load `entity_frame`
+
+**Note.** The following chunks load the `content_corpus` and `entity_frame`.
+
+```{r echo = T}
+### --- data
+# - load entities_frame
+entities_frame <- fread(paste0(analyticsDir, 
+                               "entitiesFrame_03_fullText.csv"))
+entities_frame$V1 <- NULL
+# - load content_corpus_stats.csv
+content_corpus_stats <- fread(paste0(analyticsDir,
+                                     "content_corpus_stats.csv"))
+content_corpus_stats$V1 <- NULL
+content_corpus_stats <- as.list(content_corpus_stats)
+```
+
+### 3. Prepare to produce the following text corpora: Reference Corpus for Wikidata entities, Target Corpus for news, and Joint Corpus which encompasses both
+
+This are just data wrangling procedures that produce the `jointCorpus`. This corpus encompasses all documents from the `referenceCorpus` (all English Wikipedia pages for all Wikidata items that act as candidates in the entity meaning disambiguation) as well as all documents in the targetCorpus (news: produced from the `content_corpus`). The `type` field differentiates between `reference` (documents in the Reference Corpus) and `target` (news).
+
+```{r echo = T, eval = F}
+### --- reference corpus
+# - find unique Wikidata entities in entities_frame
+unique_uris <- unique(entities_frame$uri)
+w_unique <- sapply(unique_uris,  function(x) {
+  which.first(entities_frame$uri %in% x)
+})
+reference_frame <- entities_frame[w_unique, ]
+write.csv(reference_frame, 
+          paste0(analyticsDir, "reference_frame.csv"))
+referenceCorpus <- data.frame(type = "reference",
+                              id = reference_frame$uri,
+                              content = reference_frame$content, 
+                              stringsAsFactors = F)
+
+### --- targetCorpus: {tm} corpus from content_corpus
+targetCorpus <- fread(paste0(analyticsDir, 'content_corpus.csv'))
+targetCorpus <- data.frame(type = "target",
+                           id = paste0("targetDoc_", 1:length(targetCorpus$text)),
+                           content = targetCorpus$text, 
+                           stringsAsFactors = F)
+
+### --- joint corpus
+jointCorpus <- rbind(referenceCorpus, targetCorpus)
+colnames(jointCorpus) <- c('type', 'doc_id', 'text')
+ds <- DataframeSource(jointCorpus)
+jointCorpusLDA <- Corpus(ds)
+rm(ds); gc()
+```
+
+
+### 4. Text-Mining Pipeline: Content Transformations over Joint Corpus
+
+**Note.** This is nothing more than a typicall text pre-processing pipeline for `joint_corpus`: clean up a bit, remove numbers, stopwords, punctuation, strip white space, and finally stematize.
+
+```{r echo = T, eval = F}
+### --- jointCorpusLDA: {tm} corpus from jointCorpus text vector
+removeURL <- content_transformer(function(x) gsub("(http[^ ]*)|(www\\.[^ ]*)", " ", x))
+jointCorpusLDA <- tm_map(jointCorpusLDA, removeURL)
+toSpace <- content_transformer(function (x , pattern ) gsub(pattern, " ", x))
+jointCorpusLDA <- tm_map(jointCorpusLDA, toSpace, "/")
+jointCorpusLDA <- tm_map(jointCorpusLDA, toSpace, "@")
+jointCorpusLDA <- tm_map(jointCorpusLDA, toSpace, "\\|")
+jointCorpusLDA <- tm_map(jointCorpusLDA, content_transformer(tolower))
+jointCorpusLDA <- tm_map(jointCorpusLDA, removeNumbers)
+jointCorpusLDA <- tm_map(jointCorpusLDA, removeWords, stopwords("english"))
+jointCorpusLDA <- tm_map(jointCorpusLDA, removePunctuation)
+jointCorpusLDA <- tm_map(jointCorpusLDA, stripWhitespace)
+jointCorpusLDA <- tm_map(jointCorpusLDA, stemDocument)
+```
+
+### 5. Produce a Common Vocabulary for `referenceCorpus` and `targetCorpus`
+
+**Note.** In `jointCorpusLDA` we have all documents from the `referenceCorpus` - the English Wikipedia articles for the candidate Wikidata entities - and `targetCorpus` - where we have all the news that we are interested in. We will know use the `jointCorpusLDA` {tm} corpus to produce a common vocabulary for the two. We will also remove sparse terms and check for any empty docs following these operations.
+
+```{r echo = T, eval = T}
+### --- selection of terms from jointCorpusLDA
+### --- to produce a common vocabulary for Reference and Target corpora:
+jointCorpusLDA_tdm <- TermDocumentMatrix(jointCorpusLDA,
+                                         control = list(tokenize = "word",
+                                                        language = "en",
+                                                        wordLengths = c(3, 11)
+                                         )
+)
+
+# - eliminate sparse terms: 
+jointCorpusLDA_tdm_sparse = removeSparseTerms(jointCorpusLDA_tdm, 0.995)
+
+# - eliminate empty documents from jointCorpusLDA_tdm_sparse
+# - refCorpLDA_tdm to sparse representation: refCorpLDA_tdm_sparse
+jointCorpusLDA_tdm_sparse <- Matrix::sparseMatrix(i = jointCorpusLDA_tdm_sparse$i,
+                                                  j = jointCorpusLDA_tdm_sparse$j,
+                                                  x = jointCorpusLDA_tdm_sparse$v,
+                                                  dimnames = list(Terms = jointCorpusLDA_tdm_sparse$dimnames$Terms,
+                                                                  Docs = jointCorpusLDA_tdm_sparse$dimnames$Docs)
+)
+
+rs <- Matrix::colSums(jointCorpusLDA_tdm_sparse)
+w_rs <- unname(which(rs == 0))
+
+if (length(w_rs) > 0) {
+  # - remove empty docs from reference_frame
+  doc_ids <- jointCorpusLDA_tdm_sparse@Dimnames[[2]]
+  w_rs_id <- doc_ids[w_rs]
+  w <- grepl("^Q[[:digit:]]+", w_rs_id)
+  w <- which(w)
+  if (length(w) > 0 ) {
+    reference_frame <- filter(reference_frame, 
+                              !(reference_frame$uri %in% w_rs_id[w]))
+  }
+  # - remove from jointCorpusLDA
+  doc_ids <- which(!(doc_ids %in% w_rs_id))
+  jointCorpusLDA <- jointCorpusLDA[doc_ids]
+  
+  # - remove empty docs from jointCorpusLDA_tdm_sparse
+  jointCorpusLDA_tdm_sparse <- jointCorpusLDA_tdm_sparse[, -w_rs]
+}
+```
+
+
+### 6. Store Term-Document Frequency Matrices for `referenceCorpus` and `targetCorpus`
+
+**Note.** We have started using the `Matrix::sparseMatrix` sparse matrix representation in the previous chunk: we can also make direct use of it in the {text2vec} WardLDA implementation of the Latent Dirichlet Allocation. In the next step, we decompose the `jointCorpusLDA_tdm_sparse` term-document matrix into two such matrices: one for the `referenceCorpus` and one for the `targetCorpus`. We will use the `.mtx` [MatrixMarket format](https://stat.ethz.ch/R-manual/R-devel/library/Matrix/html/externalFormats.html) to store our sparse matrices.
+
+```{r echo = T, eval = T}
+# - decompose jointCorpusLDA_tdm_sparse
+# - into: referenceCorpusLDA_tdm_sparse, sparseCorpusLDA_tdm_sparse 
+type <- meta(jointCorpusLDA)
+w_reference <- which(type$type == 'reference')
+w_target <- which(type$type == 'target')
+# - decompose:
+refCorpLDA_tdm_sparse <- jointCorpusLDA_tdm_sparse[, w_reference]
+targetCorpLDA_tdm_sparse <- jointCorpusLDA_tdm_sparse[, w_target]
+
+# - store the refCorpLDA_tdm_sparse sparse matrix
+# - in Matrix Market .mtx format
+Matrix::writeMM(refCorpLDA_tdm_sparse,
+                paste0(analyticsDir, "refCorpLDA_tdm_sparse.mtx"))
+# - store the targetCorpus_tdm_sparse sparse matrix
+# - in Matrix Market .mtx format
+Matrix::writeMM(targetCorpLDA_tdm_sparse,
+                paste0(analyticsDir, "targetCorpLDA_tdm_sparse.mtx"))
+
+# - Vocabulary and Documents
+vocabulary <- refCorpLDA_tdm_sparse@Dimnames$Terms
+refCorpLDA_tdm_sparse_Documents <- refCorpLDA_tdm_sparse@Dimnames$Docs
+targetCorpLDA_tdm_sparse_Documents <- targetCorpLDA_tdm_sparse@Dimnames$Docs
+saveRDS(vocabulary, 
+        paste0(analyticsDir, 'vocabulary.Rds'))
+saveRDS(refCorpLDA_tdm_sparse_Documents, 
+        paste0(analyticsDir, 'refCorpLDA_tdm_sparse_Documents.Rds'))
+saveRDS(targetCorpLDA_tdm_sparse_Documents, 
+        paste0(analyticsDir, 'targetCorpLDA_tdm_sparse_Documents.Rds'))
+
+
+# - store entitiesFrame_04_fullText.csv
+write.csv(entities_frame, 
+          paste0(analyticsDir, "entitiesFrame_04_fullText.csv"))
+
+# - store content_corpus_stats
+write.csv(content_corpus_stats, 
+          paste0(analyticsDir, "content_corpus_stats.csv"))
+```
+
+### 7. Next steps
+
+We have two large Term-Documen matrices at our disposal: `refCorpLDA_tdm_sparse_Documents.mtx` for the Reference Corpus (Wikipedia articles on Wikidata items) and `targetCorpLDA_tdm_sparse_Documents.mtx` for our news corpus - the one in which we have recognized the entities in the first place. Our next step will present a topic modeling training with LDA: we will train the Reference Corpus across a wide range of topics, evaluating each time by the model perplexity to represent the Target Corpus (news).
+
+
+***
+Goran S. Milovanović & Mike Page
+
+DataKolektiv, 2019.
+
+contact: datakolektiv@datakolektiv.com
+
+![](img/DK_Logo_100.png)
+
+***
+License: [GPLv3](http://www.gnu.org/licenses/gpl-3.0.txt)
+This Notebook is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+This Notebook is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+You should have received a copy of the GNU General Public License along with this Notebook. If not, see <http://www.gnu.org/licenses/>.
+
+***
+
+
+

@@ -1,0 +1,249 @@
+---
+title: Semantic Web Technologies and Wikidata from R
+author:
+- name: Goran S. Milovanović
+  affiliation: Wikimedia Deutschland, Data Scientist, DataKolektiv, Owner
+- name: Mike Page
+  affiliation: DataKolektiv, Junior Data Scientist
+date: "`r format(Sys.time(), '%d %B %Y')`"
+abstract: 
+output:
+  html_notebook:
+    code_folding: show
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+  html_document:
+    toc: yes
+    toc_depth: 5
+---
+
+![](img/DK_Logo_100.png)
+
+***
+### Notebook 03: A Reference Corpus: English Wikipedia Articles on All Collected Wikidata Items
+**Feedback** should be send to `goran.milovanovic@datakolektiv.com`. 
+These notebooks accompany the MilanoR talk 2019/06/25.
+
+***
+
+### 1. Setup
+
+**Note.** The following chunks load packages, define the project directory tree and some constants.
+
+```{r echo = T}
+### --- setup
+
+## - libraries
+library(data.table)
+library(tidyverse)
+library(httr)
+library(jsonlite)
+library(rvest)
+library(stringr)
+
+## - directories
+dataDir <- 'data/'
+analyticsDir <- 'analytics/'
+funDir <- 'functions/'
+```
+
+
+### 2. Load `entity_frame`
+
+**Note.** The following chunks load the `content_corpus` and `entity_frame`. Reminder: `entity_frame` represents all (a) spaCy recognized named entities across (b) the documents in `content_corpus` (**note:** the `doc_id` field acts as a foreign key), as well as (c) all Wikidata concepts that will act as candidates for entities meaning disambiguation.
+
+```{r echo = T}
+# - load entities_frame
+entities_frame <- fread(paste0(analyticsDir, 
+                               "entities_frame_02_WD_match.csv"))
+entities_frame$V1 <- NULL
+
+# - load content_corpus_stats.csv
+content_corpus_stats <- fread(paste0(analyticsDir,
+                                     "content_corpus_stats.csv"))
+content_corpus_stats$V1 <- NULL
+content_corpus_stats <- as.list(content_corpus_stats)
+```
+
+### 3. Collect all English Wikipedia sitelinks for Wikidata Concepts in the `entities_frame$uri` field
+
+**Note.** We will first use the [Wikidata MediaWiki API](https://www.wikidata.org/w/api.php) to collect all the `enwiki` **sitelinks** of the respective Wikidata items. In the next step, we will use the [MediaWiki API](https://www.mediawiki.org/wiki/API:Main_page) to collect all the respective pages (i.e. English Wikipedia articles).
+
+```{r echo = T, eval = F}
+# - get page titles from Wikidata sitelinks
+concepts <- unique(entities_frame$uri)
+APIprefix <- 'https://www.wikidata.org/w/api.php?action=wbgetentities&format=json&sitefilter=enwiki&ids='
+sitelinks <- vector(mode = "list", length = length(concepts))
+# - report:
+t1 <- Sys.time()
+print(paste0("Started English Wikipedia sitelinks collection: ", t1))
+for (i in 1:length(concepts)) {
+  
+  q <- URLencode(paste0(APIprefix, concepts[i]))
+  # print(paste0("Sitelinks for: ", i, " out of ", length(concepts), ": ", concepts[i]))
+  # - contact API
+  repeat {
+    res <- tryCatch({
+      GET(q)
+    }, 
+    error = function(condition) {
+      print("API problem; wait 5 secs, try again.")
+      Sys.sleep(5)
+    })
+    if (class(res) == "response") {
+      break
+    }
+  }
+  # - response
+  # JSON:
+  if (res$status_code == 200) {
+    rc <- fromJSON(rawToChar(res$content), simplifyDataFrame = T)
+    rc <- rc$entities[[1]]$sitelinks$enwiki$title
+    if (!is.null(rc)) {
+      sitelink <- rc
+    } else {
+      sitelink <- NA
+    }
+  } else {
+    sitelink <- paste0("Status code: ", res$status_code)
+  }
+  
+  sitelinks[[i]] <- data.frame(sitelink = sitelink,
+                               concept = concepts[i], 
+                               stringsAsFactors = F)
+  
+}
+t2 <- Sys.time()
+print(paste0("Ended English Wikipedia sitelinks collection: ", t2))
+print(paste0("English Wikipedia sitelinks collection took: ", t2 - t1))
+
+# - collect sitelinks
+sitelinks <- rbindlist(sitelinks)
+# - filter and store sitelinks 
+write.csv(sitelinks, 
+          paste0(analyticsDir, 'sitelinks.csv'))
+sitelinks <- dplyr::filter(sitelinks, 
+                           !is.na(sitelink))
+write.csv(sitelinks, 
+          paste0(analyticsDir, 'sitelinks.csv'))
+rm(concepts); rm()
+```
+
+
+### 4. Use Wikidata sitelinks to collect all English Wikipedia page contents for Wikidata Concepts in the `entities_frame$uri` field
+
+Now that we have all of the entities' English sitelinks (again: they are the titles of the respective English Wikipedia pages), we proceed to the next step:use the [MediaWiki API](https://www.mediawiki.org/wiki/API:Main_page) to collect the content from the English Wikipedia.
+
+```{r echo = T, eval = F}
+# - get page content from Wikidata sitelinks
+# - report:
+t1 <- Sys.time()
+print(paste0("Started English Wikipedia corpus collection: ", t1))
+# - get page content
+APIprefix <- 'https://en.wikipedia.org/w/api.php?action=parse&format=json&prop=text&page='
+sitelinks$content <- character(length = dim(sitelinks)[1])
+for (i in 1:length(sitelinks$content)) {
+  page <- gsub(" ", "_", sitelinks$sitelink[i], fixed = T)
+  q <- URLencode(paste0(APIprefix, page))
+  # print(paste0("Content for: ", i, " out of ", length(sitelinks$content), ": ", sitelinks$sitelink[i]))
+  # - contact API
+  repeat {
+    res <- tryCatch({
+      GET(q)
+    }, 
+    error = function(condition) {
+      print("API problem; wait 5 secs, try again.")
+      Sys.sleep(5)
+    })
+    if (class(res) == "response") {
+      break
+    }
+  }
+  # - response
+  # JSON:
+  if (res$status_code == 200) {
+    rc <- fromJSON(rawToChar(res$content), simplifyDataFrame = T)
+    if (!is.null(rc$parse$text$`*`)) {
+      rc <- html_text(read_html(rc$parse$text$`*`))
+    } else {
+      rc <- NA
+    }
+    if (!is.null(rc)) {
+      content <- rc
+    } else {
+      content <- NA
+    }
+  } else {
+    content <- paste0("Status code: ", res$status_code)
+  }
+  
+  sitelinks$content[i] <- content
+  
+}
+t2 <- Sys.time()
+print(paste0("Ended English Wikipedia corpus collection: ", t2))
+print(paste0("English Wikipedia sitelinks corpus took: ", t2 - t1))
+
+# - store sitelinks as: sitelinks_fullText.csv
+write.csv(sitelinks, 
+          paste0(analyticsDir, "sitelinks_fullText.csv"))
+# - filter sitelinks$content for NAs
+sitelinks <- dplyr::filter(sitelinks,
+                           !is.na(content))
+# - store sitelinks as: sitelinks_fullText.csv
+write.csv(sitelinks, 
+          paste0(analyticsDir, "sitelinks_fullText.csv"))
+```
+
+### 5. Collect all data to the `entities_frame` dataframe
+
+Finally, we join the page contents from English Wikipedia to the candidate Wikidata items for disambiguation in `entities_frame`:
+
+```{r echo = T, eval = T}
+# - enter full text to entitiesFrame
+sitelinks <- read.csv(paste0(analyticsDir, "sitelinks_fullText.csv"),
+                      header = T,
+                      check.names = F,
+                      row.names = 1,
+                      stringsAsFactors = F)
+entities_frame <- dplyr::left_join(entities_frame,
+                                   sitelinks,
+                                   by = c("uri" = "concept"))
+rm(sitelinks); gc()
+# - remove all Wikidata items w/o sitelinks and content pages:
+entities_frame <- dplyr::filter(entities_frame, 
+                                !is.na(content))
+
+# - unique N of entities w. content in English Wikipedia:
+content_corpus_stats$N_entites_EnWikipiedia_Content <- 
+  length(unique(entities_frame$text))
+
+# - store entitiesFrame_03_fullText.csv
+write.csv(entities_frame, 
+          paste0(analyticsDir, "entitiesFrame_03_fullText.csv"))
+
+# - store content_corpus_stats
+write.csv(content_corpus_stats, 
+          paste0(analyticsDir, "content_corpus_stats.csv"))
+```
+
+***
+Goran S. Milovanović & Mike Page
+
+DataKolektiv, 2019.
+
+contact: datakolektiv@datakolektiv.com
+
+![](img/DK_Logo_100.png)
+
+***
+License: [GPLv3](http://www.gnu.org/licenses/gpl-3.0.txt)
+This Notebook is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+This Notebook is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+You should have received a copy of the GNU General Public License along with this Notebook. If not, see <http://www.gnu.org/licenses/>.
+
+***
+
+

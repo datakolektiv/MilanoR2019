@@ -1,0 +1,655 @@
+---
+title: Semantic Web Technologies and Wikidata from R
+author:
+- name: Goran S. Milovanović
+  affiliation: Wikimedia Deutschland, Data Scientist, DataKolektiv, Owner
+- name: Mike Page
+  affiliation: DataKolektiv, Junior Data Scientist
+date: "`r format(Sys.time(), '%d %B %Y')`"
+abstract: 
+output:
+  html_notebook:
+    code_folding: show
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+  html_document:
+    toc: yes
+    toc_depth: 5
+---
+
+![](img/DK_Logo_100.png)
+
+***
+### Notebook A: Accessing Wikidata and Wikipedia from R
+**Feedback** should be send to `goran.milovanovic@datakolektiv.com`. 
+These notebooks accompany the MilanoR talk 2019/06/25.
+
+***
+
+## 0. Setup
+
+**Note.** The following chunks load packages and define the project directory tree.
+
+```{r echo = T, eval = T, message = F}
+### --- setup
+
+## - libraries
+library(data.table)
+library(dplyr)
+library(stringr)
+library(WikidataQueryServiceR)
+library(WikipediR)
+library(WikidataR)
+library(httr)
+library(jsonlite)
+library(rvest)
+
+### --- directories
+dataDir <- 'data/'
+analyticsDir <- 'analytics/'
+funDir <- 'functions/'
+```
+
+
+## 1. Accessing Wikidata from R: the API and its R client library for Wikidata
+
+### 1A. The {WikidataR} package
+
+The {WikidataR} package wraps-up the [Wikidata MediaWiki API](https://www.wikidata.org/wiki/Wikidata:Data_access#MediaWiki_API) (see [API documentation](https://www.wikidata.org/w/api.php)) calls for you. If you are about to use the Wikidata directly API, use the modules that return JSON: `wbgetentities` and `wbsearchentities`. 
+
+**Example.** Retrieve `Q490` (it is: Milano) and study its structure.
+
+```{r echo = T, eval = T}
+# - Retrieve the Wikidata item: Milano (Q490) 
+item <- get_item(id = 490)
+class(item)
+```
+
+It is really a list:
+
+```{r echo = T, eval = T}
+# - Retrieve the Wikidata item: Milano (Q490) 
+item_components <- sapply(item, names)
+```
+
+Type is `item`:
+
+```{r echo = T, eval = T}
+# - Retrieve the Wikidata item: Milano (Q490) 
+item[[1]]$type
+```
+
+Labels is a list of `labels` in all available languages:
+
+```{r echo = T, eval = T}
+labels <- lapply(item[[1]]$labels, function(x) {
+  data.frame(language = unlist(x)[1],
+             value = unlist(x)[2], 
+             stringsAsFactors = F)
+})
+labels <- rbindlist(labels)
+head(labels, 10)
+```
+
+Item descriptions, in all available languages:
+
+```{r echo = T, eval = T}
+descriptions <- lapply(item[[1]]$descriptions, function(x) {
+  data.frame(language = unlist(x)[1],
+             value = unlist(x)[2], 
+             stringsAsFactors = F)
+})
+descriptions <- rbindlist(descriptions)
+head(descriptions, 10)
+```
+
+Item aliases, in all available languages:
+
+```{r echo = T, eval = T}
+aliases <- lapply(item[[1]]$aliases, function(x) {
+  data.frame(language = unlist(x)[1],
+             value = unlist(x)[2], 
+             stringsAsFactors = F)
+})
+aliases <- rbindlist(aliases)
+head(aliases, 10)
+```
+
+Sitelinks (the titles of the respective Wiki pages) in all available Wikimedia projects:
+
+```{r echo = T, eval = T}
+sitelinks <- lapply(item[[1]]$claims, function(x) {
+  data.frame(project = unlist(x)[1],
+             value = unlist(x)[2], 
+             stringsAsFactors = F)
+})
+sitelinks <- rbindlist(sitelinks)
+head(sitelinks, 10)
+```
+
+The main course: **claims**
+
+```{r echo = T, eval = T}
+# - Retrieve the Wikidata item: Milano (Q490)
+# list of all claims for Milano (Q490)
+claims <- names(item[[1]]$claims)
+head(claims, 20)
+```
+
+What is `P2924`? Use `WikidataR::get_property()`:
+
+```{r echo = T, eval = T}
+prop <- get_property(id = 'P2924')
+prop[[1]]$labels$en$value
+```
+
+Describe Milano: of which Wikidata classes is `Milano (Q490)` an `instance of (P31)`?
+
+```{r echo = T, eval = T}
+# - extract statements and ranks
+itemP31Classes <- cbind(item[[1]]$claims$P31$mainsnak$datavalue$value,
+                            item[[1]]$claims$P31$rank)
+colnames(itemP31Classes) <- c('entity-type', 'numeric-id', 'id', 'rank')
+itemP31Classes <- itemP31Classes %>% 
+  select(`entity-type`, id, rank)
+  
+# - fetch class labels
+itemP31Classes_labels <- sapply(itemP31Classes$id, function(x) {
+  i <- get_item(x)
+  i[[1]]$labels$en$value
+})
+itemP31Classes$labels <- itemP31Classes_labels
+
+# - extract statement qualifiers
+itemP31Classes_qualifiers <- lapply(item[[1]]$claims$P31$qualifiers, function(x) {
+  cl <- lapply(x, function(y) {
+      if ('entity-type' %in% colnames(y$datavalue$value) & !is.null(y)) {
+          data.frame(property = y$property,
+                     value = y$datavalue$value$id,
+                     stringsAsFactors = F)
+      } else if ('time' %in% colnames(y$datavalue$value) & !is.null(y)) {
+          data.frame(property = y$property,
+                     value = y$datavalue$value$time,
+                     stringsAsFactors = F)
+        } else {
+            data.frame(property = NA,
+                       value = NA,
+                       stringsAsFactors = F)
+          }
+  })
+  rbindlist(cl, use.names = T, fill = T)
+})
+itemP31Classes_qualifiers <- Reduce(cbind, itemP31Classes_qualifiers)
+length_prop_pairs <- length(colnames(itemP31Classes_qualifiers))/2
+new_colnames <- unlist(lapply(1:length_prop_pairs, function(x) {
+  paste0(c('property', 'value'), x)
+  }))
+colnames(itemP31Classes_qualifiers) <- new_colnames 
+
+# - cbind itemP31Classes and itemP31Classes_qualifiers
+itemP31Classes <- cbind(itemP31Classes, itemP31Classes_qualifiers)
+
+# - fetch all entity labels
+searchEntities <- unique(c(itemP31Classes$id,
+                         itemP31Classes$property1,
+                         itemP31Classes$value1,
+                         itemP31Classes$property2,
+                         itemP31Classes$property3))
+searchEntities <- searchEntities[!is.na(searchEntities)]
+searchItems <- get_item(searchEntities[grepl("^Q", searchEntities)])
+searchItems_labels <- sapply(searchItems, function(x) {
+  x$labels$en$value
+})
+names(searchItems_labels) <- searchEntities[grepl("^Q", searchEntities)]
+searchProperties <- get_property(searchEntities[grepl("^P", searchEntities)])
+searchProperties_labels <- sapply(searchProperties, function(x) {
+  x$labels$en$value
+})
+names(searchProperties) <- searchEntities[grepl("^P", searchEntities)]
+# - replace entity IDs by labels in itemP31Classes
+itemP31Classes$id <- sapply(itemP31Classes$id, function(x) {
+  searchItems_labels[which(names(searchItems_labels) == x)]
+})
+itemP31Classes$value1 <- sapply(itemP31Classes$value1, function(x) {
+  searchItems_labels[which(names(searchItems_labels) == x)]
+})
+itemP31Classes$property1 <- sapply(itemP31Classes$property1, function(x) {
+  searchProperties_labels[which(names(searchProperties) == x)]
+})
+itemP31Classes$property2 <- sapply(itemP31Classes$property2, function(x) {
+  searchProperties_labels[which(names(searchProperties) == x)]
+})
+itemP31Classes$property3 <- sapply(itemP31Classes$property3, function(x) {
+  searchProperties_labels[which(names(searchProperties) == x)]
+})
+
+
+# - format output
+# - extract year only from time
+itemP31Classes$value2 <- unlist(str_extract_all(itemP31Classes$value2, 
+                                         "\\d\\d\\d\\d"))
+itemP31Classes$value3 <- unlist(str_extract_all(itemP31Classes$value3, 
+                                         "\\d\\d\\d\\d"))
+describeMilano <- paste0("Milan is a ",
+                         itemP31Classes$labels, " ",
+                         itemP31Classes$property1, " ",
+                         itemP31Classes$value1, " ",
+                         itemP31Classes$value2, " - ", itemP31Classes$value3)
+describeMilano <- gsub("character.*|NA.*", "", describeMilano)
+describeMilano <- data.frame(description = describeMilano)
+describeMilano
+```
+
+The `WikidataR::find_item()` function: search Wikidata (and good luck with Word-Sense Disambiguation)
+
+```{r echo = T, eval = T}
+Milano <- find_item('Milan')
+Milano
+```
+
+What?! Where is my favorite football club?
+
+```{r echo = T, eval = T}
+MilanoAC <- find_item('AC Milan')
+MilanoAC
+```
+
+### 1B. The Wikidata MediaWiki API
+
+You really need to browse the documentation for this carefully.
+Focus on the following modules: `wbgetentities` and `wbsearchentities`.
+
+*Example.* `wbgetentities`
+
+```{r echo = T, eval = T}
+# - Wikidata MediaWiki API prefix
+APIprefix <- 'https://www.wikidata.org/w/api.php?action=wbgetentities&'
+# - Random Wikidata item
+ids <- paste0("Q", round(runif(20, 1, 1000)))
+ids <- paste0(ids, collapse = "|")
+# - Compose query
+query <- paste0(APIprefix, 
+                    'ids=', ids, '&',
+                    'props=labels&languages=en&sitefilter=wikidatawiki&format=json')
+# - contact the API
+result <- GET(url = URLencode(query))
+# - raw to char
+result <- rawToChar(result$content)
+# - to JSON:    
+result <- fromJSON(result)
+# - parse JSON:
+itemLabels <- unlist(lapply(result$entities, function(x) {
+  x$labels$en$value
+  }))
+itemLabels <- data.frame(entity_id = names(itemLabels),
+                         label = itemLabels,
+                         stringsAsFactors = F)
+itemLabels
+```
+
+*Example.* `wbsearchentities`
+
+```{r echo = T, eval = T}
+# - Wikidata MediaWiki API prefix
+APIprefix <- 'https://www.wikidata.org/w/api.php?action=wbsearchentities&'
+# - search query
+searchQuery <- "AC Milan"
+# - Compose query
+query <- paste0(APIprefix, 
+                    'search=', searchQuery, '&',
+                    'language=en&strictlanguage=true&format=json')
+# - contact the API
+result <- GET(url = URLencode(query))
+# - raw to char
+result <- rawToChar(result$content)
+# - to JSON:    
+searchResult <- fromJSON(result, simplifyDataFrame = T)
+# - fetch labels and descriptions
+searchResult <- get_item(searchResult$search$id)
+# - labels and descriptions
+descriptions <- sapply(searchResult, function(x) {
+  paste0(x$labels$en$value, ": ", x$descriptions$en$value)
+})
+descriptions
+```
+
+## 2. Accessing Wikipedia from R: the API and its R client library for Wikipedia
+
+### 2A. The {WikipediR} package
+
+How do I get to collect the content of the English Wikipedia page for a particular Wikidata item?
+First we need the item's `sitelink` to English Wikipedia (it is the title of the page in the desired Wikipedia):
+
+```{r echo = T, eval = T}
+# - Retrieve the Wikidata item: Milano (Q490) 
+item <- get_item(id = 'Q1543')
+sitelink <- item[[1]]$sitelinks$enwiki$title
+sitelink
+```
+
+Next, we use the `sitelink` to access the English Wikipedia page content via {WikipediR} w. ``.
+
+```{r echo = T, eval = T}
+ACMilan_content <- page_content(language = "en",
+                                project = "Wikipedia",
+                                page_name = sitelink,
+                                as_wikitext = FALSE)
+str(ACMilan_content)
+```
+
+*Explanation:* `$title` is, obviously, the page title, `$pageid` is the Wikipedia page id (can also be used in `page_content` to search for a page id), `revid` is the *revision id* (each time a Wikipedia page gets edited this is updated), and `$text` is the HTML of the page (note: it is HTML because we have used `as_wikitext = FALSE`, otherwise it would be wikitext - the MediaWiki mark-up).
+
+```{r echo = T, eval = T}
+substr(ACMilan_content$parse$text[[1]], 1, 2000)
+```
+
+Followint HTML removal with `{rvest}` `html_text()`:
+
+```{r echo = T, eval = T}
+substr(html_text(read_html(ACMilan_content$parse$text[[1]])), 1, 2000)
+```
+
+Because we are here mostly interested in structural properties of Wikipedia, the next {WikipediR} function that we review is `page_backlinks`. It retrieves the Wikipedia pages that have links towards the page under question. *Note:* the `namespaces` argument refers to the [Wikipedia namespaces](https://en.wikipedia.org/wiki/Wikipedia:Namespace), and `namespace = 0` is the content namespace (precisely: Main/Article). Wikidata also has its own [namespace](https://www.wikidata.org/wiki/Help:Namespaces).
+
+```{r echo = T, eval = T}
+ACMilan_backlinks <- 
+  page_backlinks(language = "en",
+                 project = "Wikipedia", 
+                 page = sitelink, 
+                 namespaces = 0)
+# - structure
+backlinks1 <- sapply(ACMilan_backlinks$query$backlinks, function(x) {
+  x$title
+})
+backlinks1
+```
+
+*Note.* The `page_backlinks` will return at maximum 50 backlinks (the default value of the `limit` parameter, see [WikipediR manual](https://cran.r-project.org/web/packages/WikipediR/WikipediR.pdf)). Let's collect the backlinks of the AC Milan's backlinks:
+
+```{r echo = T, eval = T}
+ACMilan_backlinks2 <- lapply(backlinks1, function(x) {
+  page_backlinks(language = "en",
+                 project = "Wikipedia", 
+                 page = x, 
+                 namespaces = 0)
+}) 
+
+# - structure
+backlinks2 <- lapply(ACMilan_backlinks2, function(x) {
+  sapply(x$query$backlinks, function(y) {
+  y$title
+  })
+})
+names(backlinks2) <- backlinks1
+```
+
+What does the connectivity pattern looks like?
+
+```{r echo = T, eval = T, message = F}
+backlinks1 <- data.frame(outgoing = backlinks1, 
+                         incoming = "A.C. Milan", 
+                         stringsAsFactors = F)
+backlinks2 <- stack(backlinks2)
+backlinks2 <- data.frame(outgoing = backlinks2$values,
+                         incoming = backlinks2$ind, 
+                         stringsAsFactors = F)
+pattern <- rbind(backlinks1, backlinks2) 
+# - fix "AC Milan" to "A.C. Milan"
+pattern$outgoing <- gsub("AC Milan", "A.C. Milan", pattern$outgoing, fixed = T)
+pattern$incoming <- gsub("AC Milan", "A.C. Milan", pattern$incoming, fixed = T)
+# - keep only nodes that receive any links
+w <- which(pattern$outgoing %in% pattern$incoming)
+pattern <- pattern[w, ]
+# - filter for the top 30 hubs to keep the network readable
+mfreq_nodes <- names(sort(table(pattern$incoming), decreasing = T)[1:30])
+pattern <- filter(pattern, 
+                  incoming %in% mfreq_nodes & outgoing %in% mfreq_nodes)
+pattern <- pattern[pattern$outgoing != pattern$incoming, ]
+# - visualize w. {igraph}
+library(igraph)
+ACMilan_net <- graph.data.frame(pattern, 
+                                directed = T)
+# - plot w. {igraph}
+par(mai = c(rep(0,4)))
+plot(ACMilan_net,
+     edge.width = .25,
+     edge.color = "darkcyan",
+     edge.arrow.size = 0.15,
+     vertex.size = 2,
+     vertex.color = "white",
+     vertex.label.color = "black",
+     vertex.label.font = 1,
+     vertex.label.family = "sans",
+     vertex.label.cex = .68,
+     vertex.label.dist = .25,
+     vertex.label.dist = .45,
+     edge.curved = 0.5,
+     margin = c(rep(0,4)))
+```
+
+
+
+### 2B. The Wikipedia MediaWiki API
+
+The API documentation is [here](https://www.mediawiki.org/wiki/API:Main_page); the [API:Query](https://www.mediawiki.org/wiki/API:Query) (`action=query`) modules are especially interesting.
+
+```{r echo = T, eval = T}
+# - English Wikipedia MediaWiki API prefix
+APIprefix <- 'https://en.wikipedia.org/w/api.php?'
+# - search query
+titles <- "A.C. Milan"
+# - fix search query: replace all '\\s' (regex: space) by '_'
+titles <- gsub("\\s", "_", titles)
+# - Compose query
+query <- paste0(APIprefix, 
+                    'action=query&prop=extracts&titles=Stack%20Overflow&redirects=true&format=json&titles=',
+                    titles)
+# - contact the API
+result <- GET(url = URLencode(query))
+# - raw to char
+result <- rawToChar(result$content)
+# - to JSON:    
+searchResult <- fromJSON(result, simplifyDataFrame = T)
+# - extract page content from JSON and clean-up HTML from {rvest}
+pageContent <- searchResult$query$pages$`18940588`$extract
+substr(html_text(read_html(pageContent)), 1, 2000)
+```
+
+*Note.* Remember how the constraint of the `page_backlinks` function in `{WikipediR}` was that it will return at maximum 50 backlinks from a particular page? That is actually a constraint of the MediaWiki API, and it can be bypassed by **query continuation**.
+
+```{r echo = T, eval = T}
+# - collect all backlinks from A. C. Milan
+# - English Wikipedia MediaWiki API prefix
+APIprefix <- 'https://en.wikipedia.org/w/api.php?'
+# - search query
+titles <- "A.C. Milan"
+# - fix search query: replace all '\\s' (regex: space) by '_'
+titles <- gsub("\\s", "_", titles)
+# - Compose query
+query <- paste0(APIprefix, 
+                    'action=query&list=backlinks&format=json&bltitle=',
+                    titles)
+# - contact the API
+result <- GET(url = URLencode(query))
+# - raw to char
+result <- rawToChar(result$content)
+# - to JSON:    
+backlinks <- fromJSON(result, simplifyDataFrame = T)
+backlinks$query$backlinks
+```
+
+Note the presence of the `continue` element:
+
+```{r echo = T, eval = T}
+str(backlinks)
+```
+
+In order to obtain the next set of results, we need to pass the value of the `continue` parameter to our next API call:
+
+```{r echo = T, eval = T}
+# - continue backlinks from A. C. Milan
+# - value of the continue paramater from the previous API call:
+continue <- backlinks$continue$continue
+blcontinue <- backlinks$continue$blcontinue
+# - English Wikipedia MediaWiki API prefix
+APIprefix <- 'https://en.wikipedia.org/w/api.php?'
+# - search query
+titles <- "A.C. Milan"
+# - fix search query: replace all '\\s' (regex: space) by '_'
+titles <- gsub("\\s", "_", titles)
+# - Compose query
+query <- paste0(APIprefix, 
+                    'action=query&list=backlinks&format=json&bltitle=',
+                    titles, '&continue=', continue, '&blcontinue=', blcontinue)
+# - contact the API
+result <- GET(url = URLencode(query))
+# - raw to char
+result <- rawToChar(result$content)
+# - to JSON:    
+backlinks2 <- fromJSON(result, simplifyDataFrame = T)
+backlinks2$query$backlinks
+```
+
+Let's collect *all* backlinks from the `A. C. Milan` page:
+
+```{r echo = T, eval = T}
+# - store results
+backlinks <- list()
+# - English Wikipedia MediaWiki API prefix
+APIprefix <- 'https://en.wikipedia.org/w/api.php?'
+# - search query
+titles <- "A.C. Milan"
+# - compose initial query
+query <- paste0(APIprefix,
+                'action=query&list=backlinks&format=json&bltitle=',
+                titles)
+# - count
+counter = 1
+repeat {
+  # - contact the API
+  result <- GET(url = URLencode(query))
+  # - parse result
+  # - raw to char
+  result <- rawToChar(result$content)
+  # - to JSON:    
+  result <- fromJSON(result, simplifyDataFrame = T)
+  # - content:
+  backlinks[[counter]] <- result$query$backlinks
+  # - check if there are more results
+  if (!is.null(result$continue$continue)) {
+    # - pick up continuation parameters
+    continue <- result$continue$continue
+    blcontinue <- result$continue$blcontinue
+    # - increase counter
+    counter <- counter + 1
+    # - Compose continuation query
+    query <- paste0(APIprefix,
+                    'action=query&list=backlinks&format=json&bltitle=',
+                    titles, '&continue=', continue, '&blcontinue=', blcontinue)
+  } else {
+    break
+  }
+}
+backlinks <- rbindlist(backlinks, 
+                       use.names = T,
+                       fill = T)
+head(backlinks, 100)
+```
+
+*Note.* Also, see Python example w. the `requests` module [here](https://www.mediawiki.org/wiki/API:Query#Continuing_queries).
+
+Indeed, the English Wikipedia page for `A.C. Milan` has **many more backlinks** that we were able to collect initially:
+
+```{r echo = T, eval = T}
+dim(backlinks)[1]
+```
+
+Here's a function to collect all of the page's backlinks via the MediaWiki API (not production-ready; mind the packages that you might need):
+
+```{r echo = T, eval = T}
+collect_backlinks <- function(API_prefix, titles) {
+  
+  # - result
+  backlinks <- list()
+
+  # - compose initial query
+  query <- paste0(APIprefix,
+                  'action=query&list=backlinks&format=json&bltitle=',
+                  titles)
+  # - count
+  counter = 1
+  
+  repeat {
+    # - contact the API
+    repeat {
+     result <- tryCatch({
+       GET(url = URLencode(query))},
+       error = function(condition) {
+         FALSE
+       })
+     if (!(class(result) == 'logical')) {
+       break
+     }
+    }
+    
+    # - parse result
+    # - raw to char
+    result <- rawToChar(result$content)
+    # - to JSON:    
+    result <- fromJSON(result, simplifyDataFrame = T)
+    # - content:
+    backlinks[[counter]] <- result$query$backlinks
+    # - check if there are more results
+    if (!is.null(result$continue$continue)) {
+      # - pick up continuation parameters
+      continue <- result$continue$continue
+      blcontinue <- result$continue$blcontinue
+      # - increase counter
+      counter <- counter + 1
+      # - Compose continuation query
+      query <- paste0(APIprefix,
+                      'action=query&list=backlinks&format=json&bltitle=',
+                      titles, '&continue=', continue, '&blcontinue=', blcontinue)
+    } else {
+      break
+    }
+  }
+  backlinks <- rbindlist(backlinks, 
+                         use.names = T,
+                         fill = T)
+  return(backlinks)
+}
+
+# - collect A.C. Milan backlinks:
+# - English Wikipedia MediaWiki API prefix
+APIprefix <- 'https://en.wikipedia.org/w/api.php?'
+# - search query
+titles <- "A.C. Milan"
+backlinks <- collect_backlinks(API_prefix = APIprefix,
+                               titles = titles)
+```
+
+The result, again:
+
+```{r echo = T, eval = T}
+head(backlinks, 100)
+```
+
+## 3. Accessing Wikidata from R: SPARQL
+
+### 1A. SPARQL via WDQS (Wikidata Query Service)
+
+
+
+***
+Goran S. Milovanović & Mike Page
+
+DataKolektiv, 2019.
+
+contact: datakolektiv@datakolektiv.com
+
+![](img/DK_Logo_100.png)
+
+

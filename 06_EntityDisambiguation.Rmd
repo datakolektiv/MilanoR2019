@@ -1,0 +1,468 @@
+---
+title: Semantic Web Technologies and Wikidata from R
+author:
+- name: Goran S. Milovanović
+  affiliation: Wikimedia Deutschland, Data Scientist, DataKolektiv, Owner
+- name: Mike Page
+  affiliation: DataKolektiv, Junior Data Scientist
+date: "`r format(Sys.time(), '%d %B %Y')`"
+abstract: 
+output:
+  html_notebook:
+    code_folding: show
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+  html_document:
+    toc: yes
+    toc_depth: 5
+---
+
+![](img/DK_Logo_100.png)
+
+***
+### Notebook 06: Document-Level Entity Disambiguation from Wikidata
+**Feedback** should be send to `goran.milovanovic@datakolektiv.com`. 
+These notebooks accompany the MilanoR talk 2019/06/25.
+
+***
+
+### 1. Setup
+
+**Note.** The following chunks load packages, define the project directory tree and some constants.
+
+```{r echo = T, eval = T, message = F}
+### --- libraries
+library(jsonlite)
+library(WikidataR)
+library(httr)
+library(rvest)
+library(parallelDist)
+library(data.table)
+library(dplyr)
+library(snowfall)
+library(stringr)
+
+### --- directories
+dataDir <- 'data/'
+analyticsDir <- 'analytics/'
+funDir <- 'functions/'
+```
+
+
+### 2. Load the Reference LDA Topic Model
+
+**Note.** The following chunk loads the `Seletected_LDA_Model.Rds` - the selected LDA Topic Model for the Reference Corpus.
+
+```{r echo = T, eval = T, message = F}
+ldaModel <- readRDS(
+  paste0(analyticsDir, 'Seletected_LDA_Model.Rds')
+  )
+```
+
+### 3. Load the Reference LDA Topic Model and Create The Disambiguation Matrix
+
+Our goal now is to create a Disambiguation Matrix for document-level disambiguation. What we need is a matrix with a following structure:
+
+- all documents from the Target (news) corpus are represented by rows;
+- all Wikidata candidates to disambiguate agains the entities found in the news documents are represented by columns;
+- each cell represents a similarity (distance) measure between the document in the `i-th` row and the Wikidata concept in the `j-th` column. 
+
+We obtain the Disambiguation Matrix in the following way:
+
+- [Hellinger distances](https://en.wikipedia.org/wiki/Hellinger_distance) are computed between all rows of:
+
+- `refDocsTopics` - the document topical distribution in the Reference Corpus 
+- `targetDocsTopics` - the document topical distribution in the News Corpus.
+
+```{r echo = T, eval = T}
+### ----------------------------------------------------------
+### --- Disambiguation matrix
+### ----------------------------------------------------------
+refDocsTopics <- ldaModel$doc_topic_distr
+targetDocsTopics <- ldaModel$new_doc_topic_distr
+rm(ldaModel); gc()
+distMatrix <- rbind(refDocsTopics, targetDocsTopics)
+names <- rownames(distMatrix)
+rm(refDocsTopics); rm(targetDocsTopics); gc()
+
+# - Hellinger distances
+distMatrix <- parDist(distMatrix,
+                      method = "hellinger",
+                      diag = T,
+                      upper = T,
+                      threads = 7)
+distMatrix <- as.matrix(distMatrix)
+colnames(distMatrix) <- names
+rownames(distMatrix) <- names
+refDocs <- names[grepl("^Q[[:digit:]]+", names)]
+newsDocs <- names[grepl("targetDoc_", names)]
+rm(names)
+
+# - transform distMatrix: rows = newsDocs, cols = refDocs
+distMatrix <- distMatrix[which(rownames(distMatrix) %in% newsDocs), ]
+distMatrix <- distMatrix[, which(colnames(distMatrix) %in% refDocs)]
+
+# - store distMatrix
+write.csv(distMatrix, 
+          paste0(analyticsDir, "WD_dismat.csv"))
+```
+
+
+### 4. Disambiguate all recognized named entities against Wikidata 
+
+We have now established the distances between all Wikidata concepts and all documents in the Target (news) corpus.
+The following step performs disambiguation against Wikidata in the following way:
+
+- check what named entities were found in the Target corpus in the `entitiesFrame` data.frame;
+- for each recognized entity, in each document, extract only the subset of `distMatrix` with columns refering to its candidate Wikidata concepts;
+- select from the subset of 'distMatrix` the Wikidata concept with minimal distance from the document under question  as a disambiguation result for the given entity in a particular document.
+
+```{r echo = T, eval = T}
+### --------------------------------------------------
+### --- Disambiguation mapping
+### --------------------------------------------------
+# - entitiesFrame
+entitiesFrame <- fread(paste0(analyticsDir, 
+                              'entitiesFrame_04_fullText.csv'))
+entitiesFrame$V1 <- NULL
+entitiesFrame$content <- NULL
+
+# - clean up WD_dismat rownames to match the doc_id
+# - in entitiesFrame:
+rownames(distMatrix) <- gsub("targetDoc_", "", rownames(distMatrix))
+
+# - initiate cluster:
+sfInit(parallel = TRUE, 
+       cpus = 7)
+# - export
+sfExport("entitiesFrame")
+sfExport("distMatrix")
+sfLibrary(data.table)
+
+# - map:
+entities_frame_disambiguated <- sfClusterApplyLB(unique(entitiesFrame$doc_id), 
+                                         function(x) {
+                                           d <- entitiesFrame[entitiesFrame$doc_id == x, ]
+                                           solutions <- 
+                                             lapply(unique(d$searchText), function(y) {
+                                               # - extract a single
+                                               test_concepts <- entitiesFrame[entitiesFrame$doc_id == x &
+                                                                                entitiesFrame$searchText ==  y, ]
+                                               # - subset of distMatrix encompassing candidate concepts only
+                                               w <- which(colnames(distMatrix) %in% test_concepts$uri)
+                                               if (length(w) > 0) {
+                                                 test_wd_dismat <- distMatrix[x , w]
+                                                 # - compute confidence scores:
+                                                 # confidence_score <- test_wd_dismat/sum(test_wd_dismat)
+                                                 # - disambiguate
+                                                 test_result <- names(which.min(test_wd_dismat))
+                                                 # confidence_score <- unname(
+                                                 #   confidence_score[names(confidence_score) == test_result]
+                                                 # )
+                                                 # - return:
+                                                 test_concepts <- test_concepts[test_concepts$uri == test_result, ]
+                                                 # test_concepts$confidence <- confidence_score
+                                                 return(test_concepts)
+                                               } else {
+                                                 return(NULL)
+                                               }
+                                             })
+                                           rbindlist(solutions)
+                                         })
+# - stop cluster
+sfStop()
+
+# - collect entities_frame_disambiguated
+entities_frame_disambiguated <- rbindlist(entities_frame_disambiguated)
+# - store entities_frame_disambiguated
+write.csv(entities_frame_disambiguated, 
+          paste0(analyticsDir, "entities_frame_disambiguated.csv"))
+```
+
+### 5. Collect Additional Features from Wikidata
+
+We are now finally ready to collect additional features for our corpus from Wikidata. Unlike the Wikidata classes to which the items belong (by means of `P31 (Instance Of)` and `P279 (Subclass Of)`) and that we have previously used to filter out classes of items that we did not need, these time we will be collecting a different set of properties to describe the concepts present in our corpus. 
+
+Take for example the following subset of Wikidata properties for organizations:
+
+- P101 (field of work) → Q627436 (field of work)
+- P463 (member of) → Q9200127 (member)
+- P122 (basic form of government) → Q1307214 (form of government)
+- P127 (owned by) → Q16869121 (proprietor)
+- P749 (parent organization) → Q1956113 (parent company)
+- P859 (sponsor) → Q152478 (sponsor)
+- P1387 (political alignment)→ Q28819924 (political alignment)
+
+Everything starting with `P` is a property, while the items on the RHSs (e.g. `Q627436`) describe the Wikidata classes to which the **values** of these properites should belong to. All Wikidata knowledge is organized in **triplets**. For example, the following triplet: `Q312 (Apple)`, `P452 (industry)`, `Q11661 (information technology)` describes a piece of knowlegde about Apple: that it is found in the industry of information technologies. Similarly, `Q9366 (Google - internet search engine developed by Google)`, `P127 (owned by)`, `Q95 (Google - American multinational Internet and technology corporation)` encodes the following knowledge: Google search engine is owned by Google Inc.
+
+In Wikidata, the classes to which items belong in a sense of `P31 (Instance Of)` and `P279 (Subclass Of)` are encoded in the same way as the properties that we have just discussed. For example, `Q9366 (Google)`, `P31 (instance of)`, `Q4182287 (web search engine)` is a triplet encoding the knowledge that Google is a web-search engine. Similarly, the triplet `Q4182287 (web search engine)`, `P279 (subclass of)`, `Q7000900 - network search engine` tells us that a web-search engine is a subclass of network search engines. However, the problem in using these hierarchically organized classes as additional features in Information Retrieval is that they are necessarily correlated: **anything** that is a web-search engine is also a network search engine, and **anything** that is a network search engine is also a search engine, and software, and product, and artificial entity, and entity. So, if we find several web-search engines in a text corpus, and we want to include additional Wikidata properites to describe them better and enrich out topic model representation, the hierarchically organized classes will not be of any help - simply because all search engines fall together in a potentially large number of classes by means of hierarchical organization. **On the other hand**, features like `being owned by`, `being a subsidiary of`, `being a parent company of`, `being a sponsor of` and similar are **not** necessarily correlated in the sense that we have just discussed. The correlation breaks because of the different values that the later properites take, e.g. `being owned by Alphabet Inc.` for Google vs. `being owned by the Vanguard Group and Blackrock` for Apple. Thus, while the hierarchically organized class inclusion relations are necessarily redundant across wide sets of items, the properties that we are collecting now are not necessarily redundant - which means that they can carry useful information to enrich the representation of text-corpora. 
+
+The following chunk orchestrates a large number of SPARQL queries against WDQS to fetch a desired set of properites for all people, organizations, companies, and brands that we have discovered in our news corpus. All of the selected properties for these classes of items are found in the comments that follow the definitions of: `organization_propeties`, `company_properties`, `brand_properties`, and `human_properties`. **NOTE.** The Wikidata classes are again very important to adequately select the set of properties for an item: e.g. any `company` belongs to the class of `company`, but is also an `organization`, so one needs to filter this our carefully: organizations are only organizations that are not companies, etc.
+
+```{r echo = T, eval = F}
+### --------------------------------------------------
+### --- Collect Additional Features from Wikidata
+### --------------------------------------------------
+
+# - unique concepts in entities_frame_disambiguated
+concept_uris <- unique(entities_frame_disambiguated$uri)
+n_concepts <- length(concept_uris)
+
+# - WDQS endPoint:
+endPointURL <- "https://query.wikidata.org/bigdata/namespace/wdq/sparql?format=json&query="
+
+# - collectedFeatures
+collectedFeatures <- vector(mode = "list", length = n_concepts)
+
+# - properties
+organization_properties <- c('P101', 'P463', 'P122', 'P127', 'P749', 'P859', 'P1344', 'P1387')
+# - Note on Wikidata properties for organizations:
+  # P101 (field of work) → Q627436 (field of work)
+  # P463 (member of) → Q9200127 (member)
+  # P122 (basic form of government) → Q1307214 (form of government)
+  # P127 (owned by) → Q16869121 (proprietor)
+  # P749 (parent organization) → Q1956113 (parent company)
+  # P859 (sponsor) → Q152478 (sponsor)
+  # P1387 (political alignment)→ Q28819924 (political alignment)
+company_properties <- c('P452', 'P17', 'P463', 'P1454', 'P2770', 'P2283',
+                        'P355', 'P749', 'P127', 'P1830', 'P1716', 'P199')
+# - Note on Wikidata properties for companies:
+  # P452 (industry) → Q8148 (industry) | Q268592 (economic branch)
+  # P17 (country) → Q6256 (country) | Q3024240 (historical country) | Q1763527 (constituent country)
+  # P463 (member of) → Q9200127 (member)
+  # P1454 (legal form) → Q155076 (juridical person) | Q12047392 (legal form)
+  # P2770 (source of income) → Q1527264 (income)
+  # P2283 (uses) → Q1724915 (use)
+  # P355 (subsidiary) → Q658255 (subsidiary company)
+  # P749 (parent organization) → Q1956113 (parent company)
+  # P127 (owned by)
+  # P1716 (brand)→Q431289 (brand)
+  # P199 (business division) → Q334453 (division) 
+brand_properties <- c('P31', 'P279', 'P127', 'P176')
+# - Note on Wikidata properties for brands:
+  # P279 (subclass of)
+  # P127 (owned by)
+  # P176 (manufacturer)
+human_properties <- c('P27', 'P21', 'P106', 'P101', 'P39', 'P463', 
+                      'P937', 'P108', 'P1830', 'P50', 'P102')
+# - Note on Wikidata properties for people:
+  # P27 (country of citizenship) → Q42138 (citizenship)
+  # P21 (sex or gender) → Q290 (sex) | Q48277 (gender )
+  # P106 (occupation) → Q28640 (profession)
+  # P101 (field of work) → Q627436 (field of work)
+  # P39 (position held) → Q12046726 (position)
+  # P463 (member of) → Q9200127 (member)
+  # P937 (work location) → Q628858 (workplace)
+  # P108 (employer) → Q3053337 (employer)
+  # P102 (member of political party) → Q7278 (political party)
+
+# - store features from Wikidata:
+wd_features <- vector(mode = 'character', length = length(concept_uris))
+names(wd_features) <- concept_uris
+
+# - report:
+t1 <- Sys.time()
+print(paste0("Wikidata search starts: ", t1))
+
+# - iterate: fetch all WD classes to which concept_uris belong to
+for (i in 1:length(concept_uris)) {
+  
+  # - determine type of WD entity and compose SPARQL query
+  classes <- 
+    entities_frame_disambiguated$class[which(entities_frame_disambiguated$uri %in% concept_uris[i])[1]]
+  if ('Q5' %in% str_trim(strsplit(classes, split = ",")[[1]], side = 'both')) {
+    properties <- human_properties
+    # - SPARQL
+    query <- paste0('SELECT ?item ?itemLabel ?countryOfCitizenship ?countryOfCitizenshipLabel 
+                            ?gender ?genderLabel ?occupation ?occupationLabel ?fieldOfWork ?fieldOfWorkLabel 
+                            ?positionHeld ?positionHeldLabel ?memberOf ?memberOfLabel ?workLocation ?workLocationLabel 
+                            ?employer ?employerLabel ?politicalParty ?politicalPartyLabel 
+                      WHERE 
+                        {OPTIONAL { wd:', concept_uris[i], ' wdt:P27 ?countryOfCitizenship . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P21 ?gender . } 
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P106 ?occupation . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P101 ?fieldOfWork . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P39 ?positionHeld . }                       
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P463 ?memberOf . }                    
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P937 ?workLocation . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P108 ?employer . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P102 ?politicalParty . }
+                         SERVICE wikibase:label { bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en". }
+                        }')
+    
+  } else if ('Q431289' %in% str_trim(strsplit(classes, split = ",")[[1]], side = 'both')) {
+    properties <- brand_properties
+    # - SPARQL
+    query <- paste0('SELECT ?item ?itemLabel ?subClassOf ?subClassOfLabel ?ownedBy ?ownedByLabel 
+                            ?manufacturer ?manufacturerLabel
+                      WHERE 
+                        {OPTIONAL { wd:', concept_uris[i], ' wdt:P279 ?subClassOf . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:127 ?ownedBy . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P176 ?manufacturer . }
+                         SERVICE wikibase:label { bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en". }
+                        }')
+  } else if ('Q783794' %in% str_trim(strsplit(classes, split = ",")[[1]], side = 'both')) {
+    properties <- company_properties
+    # - SPARQL
+    query <- paste0('SELECT ?item ?itemLabel ?industry ?industryLabel ?country ?countryLabel 
+                            ?memberOf ?memberOfLabel ?legalForm ?legalFormLabel ?productProduced ?productProducedLabel 
+                            ?sourceOfIncome ?sourceOfIncomeLabel ?uses ?usesLabel ?subsidiary ?subsidiaryLabel 
+                            ?parentOrganization ?parentOrganizationLabel ?ownedBy ?ownedByLabel  
+                            ?brand ?brandLabel ?businessDivision ?businessDivisionLabel
+                      WHERE 
+                        {OPTIONAL { wd:', concept_uris[i], ' wdt:P452 ?industry . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P17 ?country . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P463 ?memberOf . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P1454 ?legalForm . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P2770 ?sourceOfIncome . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P2283 ?uses . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P355 ?subsidiary . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P749 ?parentOrganization . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P7127 ?ownedBy . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P1716 ?brand . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P199 ?businessDivision . }
+                         SERVICE wikibase:label { bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en". }
+                        }')
+  } else if (('Q43229' %in% str_trim(strsplit(classes, split = ",")[[1]], side = 'both')) & 
+             !('Q783794' %in% str_trim(strsplit(classes, split = ",")[[1]], side = 'both'))) {
+    properties <- organization_properties
+    query <- paste0('SELECT ?item ?itemLabel ?fieldOfWork ?fieldOfWorkLabel ?basicFormOfGovernment ?basicFormOfGovernmentLabel 
+                            ?memberOf ?memberOfLabel ?ownedBy ?ownedByLabel ?parentOrganization ?parentOrganizationLabel 
+                            ?sponsor ?sponsorLabel ?participantOf ?participantOfLabel ?politicalAlignment ?politicalAlignmentLabel 
+                      WHERE 
+                        {OPTIONAL { wd:', concept_uris[i], ' wdt:P101 ?fieldOfWork . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P122 ?basicFormOfGovernment . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P463 ?memberOf . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P127 ?ownedBy . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P749 ?parentOrganization . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P859 ?sponsor . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P1344 ?participantOf . }
+                         OPTIONAL { wd:', concept_uris[i], ' wdt:P1387 ?politicalAlignment . }
+                         SERVICE wikibase:label { bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en". }
+                        }')
+  } else {
+    properties <- NULL
+  }
+  
+  # - fetch from WDQS
+  if (!is.null(properties)) {
+  
+    # - to runtime Log:
+    print(paste0("--- SPARQL query:", i, "/", n_concepts, " : ", concept_uris[i]))
+    
+    # - init repeat counter
+    c <- 0
+    # - run query:
+      repeat {
+        res <- tryCatch(
+          {GET(url = paste0(endPointURL, URLencode(query)))},
+          warning = function(cond) {
+            # - return error:
+            c <- c + 1
+            print(paste("Error on GET: ", i, " failed w. warning; repeating: ", c, sep = ""))
+            Sys.sleep(1)
+            'warning'
+          }, 
+          error = function(cond) {
+            # - return error:
+            c <- c + 1
+            print(paste("Error now GET: ", i, " failed w. error; repeating: ", c, sep = ""))
+            Sys.sleep(1)
+            
+            'error'
+          })
+        if ((class(res) == "response") | (c > 10)) {
+          break
+        }
+      }
+    
+    # - if response:
+    if (c > 10 | res$status_code != 200) {
+      
+      wd_features[i] <- "NONE - Could not fetch from WDQS."
+      break
+      
+    } else {
+      
+      # - parse query
+      rc <- rawToChar(res$content)
+      
+      rc <- tryCatch({
+          rc <- fromJSON(rc, simplifyDataFrame = T)
+        }, 
+        error = function(condition) {FALSE}
+        )
+      
+      # - extract data:
+      if (class(rc) == 'list') {
+        
+        # - clean:
+        rm(res); gc()
+        
+        # - extract:
+        if (dim(rc$results$bindings)[2] > 0) {
+          features <- dplyr::select(rc$results$bindings,
+                                    ends_with('Label'))
+          features <- lapply(features, function(x) {
+            d <- unique(x$value)
+          })
+          names(features) <- gsub("Label", "", names(features))
+          for (j in 1:length(features)) {
+            features[[j]] <- paste0(names(features[j]), "_", features[[j]])
+            features[[j]] <- gsub("\\s", "_", features[[j]])
+            features[[j]] <- toupper(features[[j]])
+          }
+          
+          # - store features
+          print(paste0("Done concept :", i, " out of ", n_concepts))
+          wd_features[i] <- paste(unname(unlist(features)), collapse = ", ")
+        } else {
+          wd_features[i] <- "NONE - empty dataset."
+          }
+        } else {
+          wd_features[i] <- "NONE - class(res) is not 'list'."
+        }
+      }
+    
+    } else {
+      wd_features[i] <- "NONE - No properties to fetc."
+      }
+
+  # - next uri    
+}
+print(paste0("Wikidata search ends:", Sys.time()))
+print(paste0("Wikidata search: ", Sys.time() - t1))
+# - join to entities_frame_disambiguated
+entities_frame_disambiguated <- dplyr::left_join(entities_frame_disambiguated, 
+                                                 data.frame(uri = names(wd_features), 
+                                                            features = wd_features, 
+                                                            stringsAsFactors = F),
+                                                 by = "uri")
+entities_frame_disambiguated$features[
+  grepl("^NONE -", entities_frame_disambiguated$features)] <- NA
+# - store entities_frame_disambiguated_Final
+write.csv(entities_frame_disambiguated, 
+          paste0(analyticsDir, "entities_frame_disambiguated_final.csv"))
+
+```
+
+
+***
+Goran S. Milovanović & Mike Page
+
+DataKolektiv, 2019.
+
+contact: datakolektiv@datakolektiv.com
+
+![](img/DK_Logo_100.png)
+
+***
+License: [GPLv3](http://www.gnu.org/licenses/gpl-3.0.txt)
+This Notebook is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+This Notebook is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+You should have received a copy of the GNU General Public License along with this Notebook. If not, see <http://www.gnu.org/licenses/>.
+
+***
+

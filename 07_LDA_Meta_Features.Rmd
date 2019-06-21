@@ -1,0 +1,431 @@
+---
+title: Semantic Web Technologies and Wikidata from R
+author:
+- name: Goran S. Milovanović
+  affiliation: Wikimedia Deutschland, Data Scientist, DataKolektiv, Owner
+- name: Mike Page
+  affiliation: DataKolektiv, Junior Data Scientist
+date: "`r format(Sys.time(), '%d %B %Y')`"
+abstract: 
+output:
+  html_notebook:
+    code_folding: show
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+  html_document:
+    toc: yes
+    toc_depth: 5
+---
+
+![](img/DK_Logo_100.png)
+
+***
+### Notebook 06: Document-Level Entity Disambiguation from Wikidata
+**Feedback** should be send to `goran.milovanovic@datakolektiv.com`. 
+These notebooks accompany the MilanoR talk 2019/06/25.
+
+***
+
+### 1. Setup
+
+**Note.** The following chunks load packages, define the project directory tree and some constants.
+
+```{r echo = T, eval = T, message = F}
+### --- libraries
+library(data.table)
+library(tidyverse)
+library(ggrepel)
+library(igraph)
+library(stringr)
+library(tm)
+library(BBmisc)
+library(text2vec)
+library(snowfall)
+
+### --- directories
+dataDir <- 'data/'
+analyticsDir <- 'analytics/'
+funDir <- 'functions/'
+```
+
+### 2. Load the News Corpus and `entities_frame_disambiguated_final.csv` - the concept disambiguation results
+
+Recap: `content_corpus` is the news corpus that we are interested in. The `entities_frame_disambiguated` data.frame encompasses all (a) recognized named entities in the `content_corpus` that (b) were disambiguated against Wikidata items in the previous step and (c) all their Wikidata classes alongside other properites that we have selected to represent their features (e.g. `occupation`, `gender`, etc. for people, `legalForm`, `ownedBy`, etc. for companies, etc.). We now enter all of the selected Wikidata properties as features into the BOW approach and perform topic modeling with an enriched corpus.
+
+```{r echo = T, eval = T}
+# - load:
+# - content_corpus
+content_corpus <- fread(paste0(analyticsDir, 
+                               'content_corpus.csv'))
+content_corpus$V1 <- NULL
+# - entities_frame_disambiguated
+entities_frame_disambiguated <- fread(paste0(analyticsDir, 
+                                             'entities_frame_disambiguated_final.csv'))
+entities_frame_disambiguated$V1 <- NULL
+```
+
+
+### 3. Enter Wikidata properites as features
+
+The following chunk throws in the Wikidata features into `content_corpus`: all found features enter the BOW (i.e. are being copied into the respective documents) directly.
+
+```{r echo = T, eval = T}
+### --------------------------------------------------
+### --- Wikidata classes begin to act as features:
+### --- enter content_corpus
+### --------------------------------------------------
+# - join
+WDclasses <- lapply(content_corpus$doc_id,
+                    function(x) {
+                      classes <-
+                        entities_frame_disambiguated$features[entities_frame_disambiguated$doc_id %in% x]
+                      if (sum(is.na(classes)) > 0) {classes <- classes[!is.na(classes)]}
+                      classes <- unname(unlist(lapply(classes, function(y) {
+                        cl <- strsplit(y, split = ", ")[[1]]
+                        cl <- paste0("wd_", cl)
+                        return(cl)
+                      })))
+                      classes <- paste(classes, collapse = ", ")
+                      if (length(classes) > 0 & !is.na(classes)) {
+                       return(
+                        data.frame(doc_id = x, 
+                                   classes = classes,
+                                   stringsAsFactors = F)
+                        ) 
+                      } else {
+                        return(NULL)
+                        }
+                      })
+WDclasses <- rbindlist(WDclasses)
+content_corpus <- dplyr::left_join(content_corpus, 
+                                   WDclasses, 
+                                   by = "doc_id")
+rm(WDclasses); rm(entities_frame_disambiguated)
+```
+
+### 4. Pre-process News Corpus
+
+This is a typical text-mining pre-processing pipeline for `content_corpus` which now becomes a `{tm}` corpus. The Wikidata features are not undergoing any transformation and are marked by putting `wd_` in front of them.
+
+```{r echo = T, eval = T}
+### --------------------------------------------------
+### --- Pre-processing:
+### --- content_corpus 
+### --------------------------------------------------
+ds <- DataframeSource(content_corpus)
+corpus <- Corpus(ds)
+rm(ds); gc()
+rm(content_corpus)
+
+### --- content transformations: manual
+# - [NOTE ]MikeP: please improve this procedure if possible
+# referenceCorpus <- gsub("\\.mw-parser.+\\}", " ", referenceCorpus)
+### --- [NOTE ] Clean-up http and https URLs too.
+### --- jointCorpusLDA: {tm} corpus from jointCorpus text vector
+toSpace <- content_transformer(function (x , pattern ) gsub(pattern, " ", x))
+corpus <- tm_map(corpus, toSpace, "/")
+corpus <- tm_map(corpus, toSpace, "@")
+corpus <- tm_map(corpus, toSpace, "\\|")
+corpus <- tm_map(corpus, content_transformer(tolower))
+corpus <- tm_map(corpus, removeNumbers)
+corpus <- tm_map(corpus, removeWords, stopwords("english"))
+corpus <- tm_map(corpus, removePunctuation)
+corpus <- tm_map(corpus, stripWhitespace)
+corpus <- tm_map(corpus, stemDocument)
+### --- add Wikidata classes to all documents
+classes <- meta(corpus, tag = "classes")
+classes <- sapply(classes$classes, function(x) {
+  gsub(",", " ", x, fixed = T)
+})
+classes <- unname(classes)
+classes <- sapply(classes, function(x) {
+  paste0("wd_", x)
+})
+for (i in 1:length(corpus)) {
+  corpus[[i]]$content <- 
+    paste0(corpus[[i]]$content, " ", classes[i])
+}
+rm(classes)
+```
+
+### 5. Term-Document Matrix from Corpus
+
+Produce the TDM for `corpus`.
+
+```{r echo = T, eval = T}
+### --- selection of terms from corpus
+corpusLDA_tdm_sparse <- TermDocumentMatrix(corpus,
+                                           control = list(tokenize = "word",
+                                                          language = "en",
+                                                          wordLengths = c(3, 11)
+                                                          )
+                                           )
+
+
+# - corpusLDA_tdm_sparse to sparse representation: corpusLDA_tdm_sparse
+corpusLDA_tdm_sparse <- Matrix::sparseMatrix(i = corpusLDA_tdm_sparse$i,
+                                             j = corpusLDA_tdm_sparse$j,
+                                             x = corpusLDA_tdm_sparse$v,
+                                             dimnames = list(corpusLDA_tdm_sparse$dimnames$Terms,
+                                                             corpusLDA_tdm_sparse$dimnames$Docs)
+)
+
+# - transpose the matrix
+# - for {text2vec} so that col names = terms:
+corpusLDA_tdm_sparse <- Matrix::t(corpusLDA_tdm_sparse)
+# - check for empty documents
+rs <- Matrix::rowSums(corpusLDA_tdm_sparse)
+w_rs <- unname(which(rs == 0))
+```
+
+### 6. Topic Model: 5-fold CV LDA with {text2vec}
+
+We will perform the LDA topic modeling with a 5-fold cross-validation procedure, training in parallel.  
+
+```{r echo = T, eval = T}
+### --------------------------------------------------
+### --- LDA training:
+### --- content_corpus 
+### --------------------------------------------------
+
+# - 5-fold CV of corpusLDA_tdm_sparse
+num_docs <- dim(corpusLDA_tdm_sparse)[1]
+k_size <- round(num_docs/5)
+add_k <- num_docs - 5*k_size
+assignments <- c(rep(1, k_size),
+                 rep(2, k_size), 
+                 rep(3, k_size),
+                 rep(4, k_size), 
+                 rep(5, k_size + add_k)
+)
+assignments <- sample(assignments)
+# - produce folds:
+folds <- lapply(1:5, function (x) {
+  w <- which(assignments %in% x)
+  corpusLDA_tdm_sparse[w, ]
+})
+
+# - range of topics
+nTops <- seq(10, 3000, by = 10)
+
+# - store perplexities for each fold
+perplexity <- vector(mode = "list", length = 5)
+
+# - cross-validation LDA Training
+for (i in 1:5) {
+
+  # - training and test:  
+  testTDM <- folds[[i]]
+  train1 <- setdiff(1:5, i)[1]
+  train2 <- setdiff(1:5, i)[2]
+  train3 <- setdiff(1:5, i)[3]
+  train4 <- setdiff(1:5, i)[4]
+  trainTDM <- Matrix::rBind(folds[[train1]],
+                            folds[[train2]],
+                            folds[[train3]],
+                            folds[[train4]])
+  
+  # - LDA:
+  
+  # - initiate cluster:
+  sfInit(parallel = TRUE, 
+         cpus = 7)
+  # - export
+  sfExport("nTops")
+  sfExport("trainTDM")
+  sfExport("testTDM")
+  sfLibrary(text2vec)
+  
+  # - train in parallel:
+  # - train:
+  print(paste0("---------------- Running fold: ", i))
+  t1 <- Sys.time()
+  print(paste0("Training starts:", t1))
+  modelPerplexity <- sfClusterApplyLB(nTops,
+                                      function(x) {
+                                        # - define model:
+                                        # - alpha:
+                                        doc_topic_prior = 50/x
+                                        # - beta:
+                                        topic_word_prior = 1/x
+                                        # - lda_model:
+                                        lda_model <- text2vec:::LatentDirichletAllocation$new(n_topics = x,
+                                                                                              doc_topic_prior,
+                                                                                              topic_word_prior)
+                                        # - train:
+                                        doc_topic_distr <- lda_model$fit_transform(trainTDM, 
+                                                                                   n_iter = 100,
+                                                                                   convergence_tol = -1, 
+                                                                                   n_check_convergence = 25,
+                                                                                   progressbar = FALSE)
+                                        # - compute perplexity:
+                                        new_doc_topic_distr = lda_model$transform(testTDM)
+                                        return(
+                                          text2vec:::perplexity(testTDM,
+                                                                topic_word_distribution = lda_model$topic_word_distribution,
+                                                                doc_topic_distribution = new_doc_topic_distr)
+                                        )
+                                      })
+  
+  print(paste0("Training ends:", Sys.time()))
+  print(paste0("Training took: ", Sys.time() - t1))
+  
+  # - store perplexities from i-th replication:
+  modelFrame <- data.frame(topics = nTops,
+                           perplexity = unlist(modelPerplexity),
+                           fold = i,
+                           stringsAsFactors = F)
+  perplexity[[i]] <- modelFrame
+  print(paste0("---------------- Completed fold: ", i))
+  # - store repl_perplexity
+  saveRDS(perplexity, paste0(analyticsDir,
+                             "ContentLDA_Perplexity_CV_Training.Rds"))
+  
+  # - stop cluster
+  sfRemoveAll()
+  sfStop()
+  
+}
+```
+
+### 7. Model Selection
+
+Again, as the following two diagrams indicate, we are facing a large number of topics.
+
+```{r echo = T, eval = T}
+# - all perplexities:
+perplexityFinal <- rbindlist(perplexity)
+write.csv(perplexityFinal, 
+          paste0(analyticsDir, 'ContentLDA_Perplexity_CV_Training_Frame.csv'))
+
+### - visualize
+ggplot(perplexityFinal, aes(x = topics,
+                            y = perplexity, 
+                            group = fold)) + 
+  geom_line(size = .25) + 
+  geom_point(size = 1.5, color = "black") + 
+  geom_point(size = 1, color = "white") + 
+  ggtitle("WarpLDA {text2vec}: Wikidata Reference Corpus\n
+          Perplexity from the News Corpus, 5-fold CV LDA, 10:1500 topics, by 10") + 
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+```
+
+```{r echo = T, eval = T}
+perplexityFinal %>% 
+  group_by(topics) %>% 
+  summarise(meanPerplexity = mean(perplexity)) %>% 
+  ggplot(aes(x = topics,
+             y = meanPerplexity)) + 
+    geom_line(size = .25) + 
+    geom_point(size = 1.5, color = "black") + 
+    geom_point(size = 1, color = "white") + 
+  ggtitle("WarpLDA {text2vec}: 5-fold CV, 10:1500 topics, by 10") + 
+  theme_bw() +
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+```
+
+### 7. Train The Optimal LDA Model
+
+Select the topic model with minimal perplexity (and that is found to be a model with 1350 topics) and train it (no cross-validation, 20 replications). Store `analysis_document_topic_matrix.csv`, the document topical distribution, and `analysis_word_topic_matrix.csv`, the word topical distribution; model selection is likelihood based now.
+
+```{r echo = T, eval = T}
+# - make some space:
+rm(corpus); rm(folds); rm(testTDM); rm(trainTDM);gc()
+
+# - determine solution:
+meanPerplexity <- perplexityFinal %>% 
+  group_by(topics) %>% 
+  summarise(meanPerplexity = mean(perplexity))
+mp <- which.min(meanPerplexity$meanPerplexity)
+mp <- meanPerplexity$topics[mp]
+
+# - LDA training for the selected model
+nTops <- rep(mp, 20)
+# - initiate cluster:
+sfInit(parallel = TRUE, 
+       cpus = 7)
+# - export
+sfExport("nTops")
+sfExport("corpusLDA_tdm_sparse")
+sfLibrary(text2vec)
+
+# - train in parallel:
+t1 <- Sys.time()
+print(paste0("Training starts:", t1))
+ldaSolution <- sfClusterApplyLB(nTops,
+                                function(x) {
+                                # - define model:
+                                # - alpha:
+                                doc_topic_prior = 50/x
+                                # - beta:
+                                topic_word_prior = 1/x
+                                # - lda_model:
+                                lda_model <- text2vec:::LatentDirichletAllocation$new(n_topics = x,
+                                                                                      doc_topic_prior,
+                                                                                      topic_word_prior)
+                                # - doc_topic_distr:
+                                doc_topic_distr <- lda_model$fit_transform(corpusLDA_tdm_sparse, 
+                                                                           n_iter = 100,
+                                                                           convergence_tol = -1, 
+                                                                           n_check_convergence = 25,
+                                                                           progressbar = FALSE)
+                                # - word_topic_distr:
+                                word_topic_distr <- lda_model$topic_word_distribution
+                                
+                                # - likelihood
+                                likelihood <- lda_model$.__enclos_env__$private$calc_pseudo_loglikelihood()
+                                
+                                # - outputs:
+                                out <- list()
+                                out$doc_topic_distr <- doc_topic_distr
+                                out$word_topic_distr <- word_topic_distr
+                                out$likelihood <- likelihood
+                                return(out)
+
+                              })
+
+
+# - stop cluster
+sfStop()
+
+print(paste0("Training ends:", Sys.time()))
+print(paste0("Training took: ", Sys.time() - t1))
+
+# - store model
+saveRDS(ldaSolution, paste0(analyticsDir,
+                           "ldaSolution_20_replications_FINAL.Rds"))
+
+# - select best:
+ll <- sapply(ldaSolution, function(x) x$likelihood)
+choice <- which.max(ll)
+
+# - store results from the best model
+result <- ldaSolution[[choice]]
+document_topic_matrix <- result$doc_topic_distr
+word_topic_matrix <- t(result$word_topic_distr)
+write.csv(document_topic_matrix, 
+          paste0(analyticsDir, "analysis_document_topic_matrix.csv"))
+write.csv(word_topic_matrix, 
+          paste0(analyticsDir, "analysis_word_topic_matrix.csv"))
+```
+
+
+***
+Goran S. Milovanović & Mike Page
+
+DataKolektiv, 2019.
+
+contact: datakolektiv@datakolektiv.com
+
+![](img/DK_Logo_100.png)
+
+***
+License: [GPLv3](http://www.gnu.org/licenses/gpl-3.0.txt)
+This Notebook is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+This Notebook is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+You should have received a copy of the GNU General Public License along with this Notebook. If not, see <http://www.gnu.org/licenses/>.
+
+***
+

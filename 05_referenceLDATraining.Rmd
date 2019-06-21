@@ -1,0 +1,835 @@
+---
+title: Semantic Web Technologies and Wikidata from R
+author:
+- name: Goran S. Milovanović
+  affiliation: Wikimedia Deutschland, Data Scientist, DataKolektiv, Owner
+- name: Mike Page
+  affiliation: DataKolektiv, Junior Data Scientist
+date: "`r format(Sys.time(), '%d %B %Y')`"
+abstract: 
+output:
+  html_notebook:
+    code_folding: show
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+  html_document:
+    toc: yes
+    toc_depth: 5
+---
+
+![](img/DK_Logo_100.png)
+
+***
+### Notebook 05: Reference Corpus: LDA Training for Document-Level WD Entitiy Disambiguation
+**Feedback** should be send to `goran.milovanovic@datakolektiv.com`. 
+These notebooks accompany the MilanoR talk 2019/06/25.
+
+***
+
+### 1. Setup
+
+**Note.** The following chunks load packages, define the project directory tree and some constants.
+
+```{r echo = T, eval = T, message = F}
+### --- setup
+
+## - libraries
+library(data.table)
+library(tidyverse)
+library(ggrepel)
+library(stringr)
+library(tm)
+library(BBmisc)
+library(text2vec)
+library(snowfall)
+
+### --- directories
+dataDir <- 'data/'
+analyticsDir <- 'analytics/'
+funDir <- 'functions/'
+```
+
+### 2. Load Term-Document Frequency Matrices
+
+**Note.** The following chunks load the `refCorpLDA_tdm_sparse` and `targetCorpLDA_tdm_sparse` sparse matrices.
+
+```{r echo = T, eval = T}
+# - load:
+# - vocabulary:
+vocabulary <- readRDS(paste0(analyticsDir, "vocabulary.Rds"))
+refCorpLDA_tdm_sparse_Documents <- readRDS(paste0(
+  analyticsDir, "refCorpLDA_tdm_sparse_Documents.Rds")
+  )
+targetCorpLDA_tdm_sparse_Documents <- readRDS(paste0(
+  analyticsDir, "targetCorpLDA_tdm_sparse_Documents.Rds")
+  )
+# - refCorpLDA_tdm_sparse, targetCorpLDA_tdm_sparse
+refCorpLDA_tdm_sparse <- Matrix::readMM(
+  paste0(analyticsDir, 'refCorpLDA_tdm_sparse.mtx')
+)
+refCorpLDA_tdm_sparse@Dimnames[[1]] <- vocabulary
+refCorpLDA_tdm_sparse@Dimnames[[2]] <- refCorpLDA_tdm_sparse_Documents
+# - refCorpLDA_tdm_sparse, targetCorpLDA_tdm_sparse
+targetCorpLDA_tdm_sparse <- Matrix::readMM(
+  paste0(analyticsDir, 'targetCorpLDA_tdm_sparse.mtx')
+)
+targetCorpLDA_tdm_sparse@Dimnames[[1]] <- vocabulary
+targetCorpLDA_tdm_sparse@Dimnames[[2]] <- targetCorpLDA_tdm_sparse_Documents
+
+# - transpose the matrices
+# - for {text2vec} so that column names == terms:
+refCorpLDA_tdm_sparse <- Matrix::t(refCorpLDA_tdm_sparse)
+targetCorpLDA_tdm_sparse <- Matrix::t(targetCorpLDA_tdm_sparse)
+```
+
+### 3.1 LDA Training Phase 1: 10:10:500 topics, 3 LDA runs for each number of topics.
+
+**Note.** We train the whole Reference Corpus (English Wikidata pages:`refCorpLDA_tdm_sparse`) and evaluate by the model perplexity over the Target Corpus (news: `targetCorpLDA_tdm_sparse`). In the previous Notebook we have aligned these two corpora to use the same vocabulary, so the two TDMs are also aligned in that respect.
+
+```{r echo = T, eval = T}
+### ----------------------------------------------------------
+### --- LDA training: refCorpLDA_tdm_sparse
+### --- topics: 10:500, by = 10
+### --- number of replications: 3
+### ----------------------------------------------------------
+
+# - params
+# - topic range:
+nTops <- seq(10, 500, by = 10)
+# - number of replications at each topic:
+n_repl <- 3
+
+# - initiate cluster:
+sfInit(parallel = TRUE, 
+       cpus = 7)
+# - export
+sfExport("nTops")
+sfExport("refCorpLDA_tdm_sparse")
+sfExport("targetCorpLDA_tdm_sparse")
+sfLibrary(text2vec)
+
+### --- Iterate: n_repl replications
+repl_perplexity <- vector(mode = "list", length = n_repl)
+
+for (i in 1:n_repl) {
+  
+  # - train in parallel:
+  # - train:
+  print(paste0("---------------- Running replication: ", i))
+  t1 <- Sys.time()
+  print(paste0("Training starts:", t1))
+  modelPerplexity <- sfClusterApplyLB(nTops,
+                                      function(x) {
+                                        # - define model:
+                                        # - alpha:
+                                        doc_topic_prior = 50/x
+                                        # - beta:
+                                        topic_word_prior = 1/x
+                                        # - lda_model:
+                                        lda_model <- LatentDirichletAllocation$new(n_topics = x,
+                                                                                              doc_topic_prior,
+                                                                                              topic_word_prior)
+                                        # - train:
+                                        doc_topic_distr <- lda_model$fit_transform(refCorpLDA_tdm_sparse, 
+                                                                                   n_iter = 100,
+                                                                                   convergence_tol = -1, 
+                                                                                   n_check_convergence = 25,
+                                                                                   progressbar = FALSE)
+                                        # - compute perplexity:
+                                        new_doc_topic_distr = lda_model$transform(targetCorpLDA_tdm_sparse)
+                                        return(
+                                          perplexity(targetCorpLDA_tdm_sparse,
+                                                                topic_word_distribution = lda_model$topic_word_distribution,
+                                                                doc_topic_distribution = new_doc_topic_distr)
+                                        )
+                                      })
+  
+  print(paste0("Training ends:", Sys.time()))
+  print(paste0("Training took: ", Sys.time() - t1))
+  
+  # - store perplexities from i-th replication:
+  modelFrame <- data.frame(topics = nTops,
+                           perplexity = unlist(modelPerplexity),
+                           replication = i,
+                           stringsAsFactors = F)
+  repl_perplexity[[i]] <- modelFrame
+  print(paste0("---------------- Completed replication: ", i))
+
+}
+# - stop cluster
+sfStop()
+
+# - Collect results:
+modelFrame <- rbindlist(repl_perplexity)
+
+# - Store results:
+write.csv(modelFrame, 
+          paste0(analyticsDir, "modelFrame_Phase_1.csv"))
+
+# - Inspect results:
+ggplot(modelFrame, aes(x = topics, 
+                       y = perplexity)) + 
+  stat_smooth(method="loess", size = .5, fullrange=TRUE) + 
+  xlim(10, 500) +
+  geom_point(size = 1.5, color = "black") + 
+  geom_point(size = 1, color = "white") + 
+  ggtitle("WarpLDA {text2vec}: Wikidata Reference Corpus\n
+          Perplexity from the News Corpus, 3 replications at each num_topics value") + 
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+```
+
+### 3.2 LDA Training Phase 2: 500:10:1000 topics, 3 LDA runs for each number of topics.
+
+More training: 510:1000 topics, by 10.
+
+```{r echo = T, eval = T}
+### ----------------------------------------------------------
+### --- LDA training: refCorpLDA_tdm_sparse
+### --- topics: 510:1000, by = 10
+### --- number of replications: 3
+### ----------------------------------------------------------
+
+# - keep results from Phase 1
+modelFrame_previous <- modelFrame
+
+# - params
+# - topic range:
+nTops <- seq(510, 1000, by = 10)
+# - number of replications at each topic:
+n_repl <- 3
+
+# - initiate cluster:
+sfInit(parallel = TRUE, 
+       cpus = 7)
+# - export
+sfExport("nTops")
+sfExport("refCorpLDA_tdm_sparse")
+sfExport("targetCorpLDA_tdm_sparse")
+sfLibrary(text2vec)
+
+### --- Iterate: n_repl replications
+repl_perplexity <- vector(mode = "list", length = n_repl)
+
+for (i in 1:n_repl) {
+  
+  # - train in parallel:
+  # - train:
+  print(paste0("---------------- Running replication: ", i))
+  t1 <- Sys.time()
+  print(paste0("Training starts:", t1))
+  modelPerplexity <- sfClusterApplyLB(nTops,
+                                      function(x) {
+                                        # - define model:
+                                        # - alpha:
+                                        doc_topic_prior = 50/x
+                                        # - beta:
+                                        topic_word_prior = 1/x
+                                        # - lda_model:
+                                        lda_model <- LatentDirichletAllocation$new(n_topics = x,
+                                                                                              doc_topic_prior,
+                                                                                              topic_word_prior)
+                                        # - train:
+                                        doc_topic_distr <- lda_model$fit_transform(refCorpLDA_tdm_sparse, 
+                                                                                   n_iter = 100,
+                                                                                   convergence_tol = -1, 
+                                                                                   n_check_convergence = 25,
+                                                                                   progressbar = FALSE)
+                                        # - compute perplexity:
+                                        new_doc_topic_distr = lda_model$transform(targetCorpLDA_tdm_sparse)
+                                        return(
+                                          perplexity(targetCorpLDA_tdm_sparse,
+                                                                topic_word_distribution = lda_model$topic_word_distribution,
+                                                                doc_topic_distribution = new_doc_topic_distr)
+                                        )
+                                      })
+  
+  print(paste0("Training ends:", Sys.time()))
+  print(paste0("Training took: ", Sys.time() - t1))
+  
+  # - store perplexities from i-th replication:
+  modelFrame <- data.frame(topics = nTops,
+                           perplexity = unlist(modelPerplexity),
+                           replication = i,
+                           stringsAsFactors = F)
+  repl_perplexity[[i]] <- modelFrame
+  print(paste0("---------------- Completed replication: ", i))
+
+}
+# - stop cluster
+sfStop()
+
+# - Collect results:
+modelFrame <- rbindlist(repl_perplexity)
+
+# - Store results:
+write.csv(modelFrame, 
+          paste0(analyticsDir, "modelFrame_Phase_2.csv"))
+
+
+# - rbind with the results from Phase 1:
+modelFrame <- rbind(modelFrame, modelFrame_previous)
+
+# - Inspect results:
+ggplot(modelFrame, aes(x = topics, 
+                       y = perplexity)) + 
+  stat_smooth(method="loess", size = .5, fullrange=TRUE) + 
+  xlim(10, 1000) +
+  geom_point(size = 1.5, color = "black") + 
+  geom_point(size = 1, color = "white") + 
+  ggtitle("WarpLDA {text2vec}: Wikidata Reference Corpus\n
+          Perplexity from the News Corpus, 3 replications at each num_topics value") + 
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+```
+
+### 3.3 LDA Training Phase 3: 1010:10:1500 topics, 3 LDA runs for each number of topics.
+
+More training: 1010:1500 topics, by 10.
+
+```{r echo = T, eval = T}
+### ----------------------------------------------------------
+### --- LDA training: refCorpLDA_tdm_sparse
+### --- topics: 1010:1500, by = 10
+### --- number of replications: 3
+### ----------------------------------------------------------
+
+# - keep results from Phase 1
+modelFrame_previous <- modelFrame
+
+# - params
+# - topic range:
+nTops <- seq(1010, 1500, by = 10)
+# - number of replications at each topic:
+n_repl <- 3
+
+# - initiate cluster:
+sfInit(parallel = TRUE, 
+       cpus = 7)
+# - export
+sfExport("nTops")
+sfExport("refCorpLDA_tdm_sparse")
+sfExport("targetCorpLDA_tdm_sparse")
+sfLibrary(text2vec)
+
+### --- Iterate: n_repl replications
+repl_perplexity <- vector(mode = "list", length = n_repl)
+
+for (i in 1:n_repl) {
+  
+  # - train in parallel:
+  # - train:
+  print(paste0("---------------- Running replication: ", i))
+  t1 <- Sys.time()
+  print(paste0("Training starts:", t1))
+  modelPerplexity <- sfClusterApplyLB(nTops,
+                                      function(x) {
+                                        # - define model:
+                                        # - alpha:
+                                        doc_topic_prior = 50/x
+                                        # - beta:
+                                        topic_word_prior = 1/x
+                                        # - lda_model:
+                                        lda_model <- LatentDirichletAllocation$new(n_topics = x,
+                                                                                              doc_topic_prior,
+                                                                                              topic_word_prior)
+                                        # - train:
+                                        doc_topic_distr <- lda_model$fit_transform(refCorpLDA_tdm_sparse, 
+                                                                                   n_iter = 100,
+                                                                                   convergence_tol = -1, 
+                                                                                   n_check_convergence = 25,
+                                                                                   progressbar = FALSE)
+                                        # - compute perplexity:
+                                        new_doc_topic_distr = lda_model$transform(targetCorpLDA_tdm_sparse)
+                                        return(
+                                          perplexity(targetCorpLDA_tdm_sparse,
+                                                                topic_word_distribution = lda_model$topic_word_distribution,
+                                                                doc_topic_distribution = new_doc_topic_distr)
+                                        )
+                                      })
+  
+  print(paste0("Training ends:", Sys.time()))
+  print(paste0("Training took: ", Sys.time() - t1))
+  
+  # - store perplexities from i-th replication:
+  modelFrame <- data.frame(topics = nTops,
+                           perplexity = unlist(modelPerplexity),
+                           replication = i,
+                           stringsAsFactors = F)
+  repl_perplexity[[i]] <- modelFrame
+  print(paste0("---------------- Completed replication: ", i))
+
+}
+# - stop cluster
+sfStop()
+
+# - Collect results:
+modelFrame <- rbindlist(repl_perplexity)
+
+# - Store results:
+write.csv(modelFrame, 
+          paste0(analyticsDir, "modelFrame_Phase_3.csv"))
+
+
+# - rbind with the results from Phase 1:
+modelFrame <- rbind(modelFrame, modelFrame_previous)
+
+# - Inspect results:
+ggplot(modelFrame, aes(x = topics, 
+                       y = perplexity)) + 
+  stat_smooth(method="loess", size = .5, fullrange=TRUE) + 
+  xlim(10, 1500) +
+  geom_point(size = 1.5, color = "black") + 
+  geom_point(size = 1, color = "white") + 
+  ggtitle("WarpLDA {text2vec}: Wikidata Reference Corpus\n
+          Perplexity from the News Corpus, 3 replications at each num_topics value") + 
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+```
+
+### 3.4 LDA Training Phase 4: 1510:10:2000 topics, 3 LDA runs for each number of topics.
+
+More training: 1510:2000 topics, by 10.
+
+```{r echo = T, eval = T}
+### ----------------------------------------------------------
+### --- LDA training: refCorpLDA_tdm_sparse
+### --- topics: 1510:2000, by = 10
+### --- number of replications: 3
+### ----------------------------------------------------------
+
+# - keep results from Phase 1
+modelFrame_previous <- modelFrame
+
+# - params
+# - topic range:
+nTops <- seq(1510, 2000, by = 10)
+# - number of replications at each topic:
+n_repl <- 3
+
+# - initiate cluster:
+sfInit(parallel = TRUE, 
+       cpus = 7)
+# - export
+sfExport("nTops")
+sfExport("refCorpLDA_tdm_sparse")
+sfExport("targetCorpLDA_tdm_sparse")
+sfLibrary(text2vec)
+
+### --- Iterate: n_repl replications
+repl_perplexity <- vector(mode = "list", length = n_repl)
+
+for (i in 1:n_repl) {
+  
+  # - train in parallel:
+  # - train:
+  print(paste0("---------------- Running replication: ", i))
+  t1 <- Sys.time()
+  print(paste0("Training starts:", t1))
+  modelPerplexity <- sfClusterApplyLB(nTops,
+                                      function(x) {
+                                        # - define model:
+                                        # - alpha:
+                                        doc_topic_prior = 50/x
+                                        # - beta:
+                                        topic_word_prior = 1/x
+                                        # - lda_model:
+                                        lda_model <- LatentDirichletAllocation$new(n_topics = x,
+                                                                                              doc_topic_prior,
+                                                                                              topic_word_prior)
+                                        # - train:
+                                        doc_topic_distr <- lda_model$fit_transform(refCorpLDA_tdm_sparse, 
+                                                                                   n_iter = 100,
+                                                                                   convergence_tol = -1, 
+                                                                                   n_check_convergence = 25,
+                                                                                   progressbar = FALSE)
+                                        # - compute perplexity:
+                                        new_doc_topic_distr = lda_model$transform(targetCorpLDA_tdm_sparse)
+                                        return(
+                                          perplexity(targetCorpLDA_tdm_sparse,
+                                                                topic_word_distribution = lda_model$topic_word_distribution,
+                                                                doc_topic_distribution = new_doc_topic_distr)
+                                        )
+                                      })
+  
+  print(paste0("Training ends:", Sys.time()))
+  print(paste0("Training took: ", Sys.time() - t1))
+  
+  # - store perplexities from i-th replication:
+  modelFrame <- data.frame(topics = nTops,
+                           perplexity = unlist(modelPerplexity),
+                           replication = i,
+                           stringsAsFactors = F)
+  repl_perplexity[[i]] <- modelFrame
+  print(paste0("---------------- Completed replication: ", i))
+
+}
+# - stop cluster
+sfStop()
+
+# - Collect results:
+modelFrame <- rbindlist(repl_perplexity)
+
+# - Store results:
+write.csv(modelFrame, 
+          paste0(analyticsDir, "modelFrame_Phase_4.csv"))
+
+
+# - rbind with the results from Phase 1:
+modelFrame <- rbind(modelFrame, modelFrame_previous)
+
+# - Inspect results:
+ggplot(modelFrame, aes(x = topics, 
+                       y = perplexity)) + 
+  stat_smooth(method="loess", size = .5, fullrange=TRUE) + 
+  xlim(10, 2000) +
+  geom_point(size = 1.5, color = "black") + 
+  geom_point(size = 1, color = "white") + 
+  ggtitle("WarpLDA {text2vec}: Wikidata Reference Corpus\n
+          Perplexity from the News Corpus, 3 replications at each num_topics value") + 
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+```
+
+### 3.5 Mean Perplexity: Select LDA Model
+
+Check the mean perplexity profile across the topics.
+
+```{r echo = T, eval = T}
+selectModel <- modelFrame %>% 
+  group_by(topics) %>% 
+  summarise(meanPerplexity = mean(perplexity))
+
+# - Plot mean perplexity from 3 replications:
+ggplot(selectModel, aes(x = topics,
+                        y = meanPerplexity)) + 
+  geom_line(size = .25) + 
+  ggtitle("WarpLDA {text2vec}: Wikidata Reference Corpus\n
+          Mean Perplexity from the News Corpus, 3 replications at each num_topics value") + 
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+
+```
+
+### 3.6 LDA Training Phase 5: 2010:10:2500 topics, 3 LDA runs for each number of topics.
+
+More training: 2010:2500 topics, by 10.
+
+```{r echo = T, eval = T}
+### ----------------------------------------------------------
+### --- LDA training: refCorpLDA_tdm_sparse
+### --- topics: 2010:2500, by = 10
+### --- number of replications: 3
+### ----------------------------------------------------------
+
+# - keep results from Phase 1
+modelFrame_previous <- modelFrame
+
+# - params
+# - topic range:
+nTops <- seq(2010, 2500, by = 10)
+# - number of replications at each topic:
+n_repl <- 3
+
+# - initiate cluster:
+sfInit(parallel = TRUE, 
+       cpus = 7)
+# - export
+sfExport("nTops")
+sfExport("refCorpLDA_tdm_sparse")
+sfExport("targetCorpLDA_tdm_sparse")
+sfLibrary(text2vec)
+
+### --- Iterate: n_repl replications
+repl_perplexity <- vector(mode = "list", length = n_repl)
+
+for (i in 1:n_repl) {
+  
+  # - train in parallel:
+  # - train:
+  print(paste0("---------------- Running replication: ", i))
+  t1 <- Sys.time()
+  print(paste0("Training starts:", t1))
+  modelPerplexity <- sfClusterApplyLB(nTops,
+                                      function(x) {
+                                        # - define model:
+                                        # - alpha:
+                                        doc_topic_prior = 50/x
+                                        # - beta:
+                                        topic_word_prior = 1/x
+                                        # - lda_model:
+                                        lda_model <- LatentDirichletAllocation$new(n_topics = x,
+                                                                                              doc_topic_prior,
+                                                                                              topic_word_prior)
+                                        # - train:
+                                        doc_topic_distr <- lda_model$fit_transform(refCorpLDA_tdm_sparse, 
+                                                                                   n_iter = 100,
+                                                                                   convergence_tol = -1, 
+                                                                                   n_check_convergence = 25,
+                                                                                   progressbar = FALSE)
+                                        # - compute perplexity:
+                                        new_doc_topic_distr = lda_model$transform(targetCorpLDA_tdm_sparse)
+                                        return(
+                                          perplexity(targetCorpLDA_tdm_sparse,
+                                                                topic_word_distribution = lda_model$topic_word_distribution,
+                                                                doc_topic_distribution = new_doc_topic_distr)
+                                        )
+                                      })
+  
+  print(paste0("Training ends:", Sys.time()))
+  print(paste0("Training took: ", Sys.time() - t1))
+  
+  # - store perplexities from i-th replication:
+  modelFrame <- data.frame(topics = nTops,
+                           perplexity = unlist(modelPerplexity),
+                           replication = i,
+                           stringsAsFactors = F)
+  repl_perplexity[[i]] <- modelFrame
+  print(paste0("---------------- Completed replication: ", i))
+
+}
+# - stop cluster
+sfStop()
+
+# - Collect results:
+modelFrame <- rbindlist(repl_perplexity)
+
+# - Store results:
+write.csv(modelFrame, 
+          paste0(analyticsDir, "modelFrame_Phase_5.csv"))
+
+
+# - rbind with the results from Phase 1:
+modelFrame <- rbind(modelFrame, modelFrame_previous)
+
+selectModel <- modelFrame %>% 
+  group_by(topics) %>% 
+  summarise(meanPerplexity = mean(perplexity))
+
+# - Plot mean perplexity from 3 replications:
+ggplot(selectModel, aes(x = topics,
+                        y = meanPerplexity)) + 
+  geom_line(size = .25) + 
+  ggtitle("WarpLDA {text2vec}: Wikidata Reference Corpus\n
+          Mean Perplexity from the News Corpus, 3 replications at each num_topics value") + 
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+```
+
+### 3.7 LDA Training Phase 5: 2510:10:3000 topics, 3 LDA runs for each number of topics.
+
+More training: 2510:3000 topics, by 10.
+
+```{r echo = T, eval = T}
+### ----------------------------------------------------------
+### --- LDA training: refCorpLDA_tdm_sparse
+### --- topics: 2510:3000, by = 10
+### --- number of replications: 3
+### ----------------------------------------------------------
+
+# - keep results
+modelFrame_previous <- modelFrame
+
+# - params
+# - topic range:
+nTops <- seq(2510, 3000, by = 10)
+# - number of replications at each topic:
+n_repl <- 3
+
+# - initiate cluster:
+sfInit(parallel = TRUE, 
+       cpus = 7)
+# - export
+sfExport("nTops")
+sfExport("refCorpLDA_tdm_sparse")
+sfExport("targetCorpLDA_tdm_sparse")
+sfLibrary(text2vec)
+
+### --- Iterate: n_repl replications
+repl_perplexity <- vector(mode = "list", length = n_repl)
+
+for (i in 1:n_repl) {
+  
+  # - train in parallel:
+  # - train:
+  print(paste0("---------------- Running replication: ", i))
+  t1 <- Sys.time()
+  print(paste0("Training starts:", t1))
+  modelPerplexity <- sfClusterApplyLB(nTops,
+                                      function(x) {
+                                        # - define model:
+                                        # - alpha:
+                                        doc_topic_prior = 50/x
+                                        # - beta:
+                                        topic_word_prior = 1/x
+                                        # - lda_model:
+                                        lda_model <- LatentDirichletAllocation$new(n_topics = x,
+                                                                                              doc_topic_prior,
+                                                                                              topic_word_prior)
+                                        # - train:
+                                        doc_topic_distr <- lda_model$fit_transform(refCorpLDA_tdm_sparse, 
+                                                                                   n_iter = 100,
+                                                                                   convergence_tol = -1, 
+                                                                                   n_check_convergence = 25,
+                                                                                   progressbar = FALSE)
+                                        # - compute perplexity:
+                                        new_doc_topic_distr = lda_model$transform(targetCorpLDA_tdm_sparse)
+                                        return(
+                                          perplexity(targetCorpLDA_tdm_sparse,
+                                                                topic_word_distribution = lda_model$topic_word_distribution,
+                                                                doc_topic_distribution = new_doc_topic_distr)
+                                        )
+                                      })
+  
+  print(paste0("Training ends:", Sys.time()))
+  print(paste0("Training took: ", Sys.time() - t1))
+  
+  # - store perplexities from i-th replication:
+  modelFrame <- data.frame(topics = nTops,
+                           perplexity = unlist(modelPerplexity),
+                           replication = i,
+                           stringsAsFactors = F)
+  repl_perplexity[[i]] <- modelFrame
+  print(paste0("---------------- Completed replication: ", i))
+
+}
+# - stop cluster
+sfStop()
+
+# - Collect results:
+modelFrame <- rbindlist(repl_perplexity)
+
+# - Store results:
+write.csv(modelFrame, 
+          paste0(analyticsDir, "modelFrame_Phase_6.csv"))
+
+
+# - rbind with the results from Phase 1:
+modelFrame <- rbind(modelFrame, modelFrame_previous)
+
+selectModel <- modelFrame %>% 
+  group_by(topics) %>% 
+  summarise(meanPerplexity = mean(perplexity))
+
+# - Plot mean perplexity from 3 replications:
+ggplot(selectModel, aes(x = topics,
+                        y = meanPerplexity)) + 
+  geom_line(size = .25) + 
+  ggtitle("WarpLDA {text2vec}: Wikidata Reference Corpus\n
+          Mean Perplexity from the News Corpus, 3 replications at each num_topics value") + 
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+
+```
+
+### 3.8 LDA Training: Selected Reference Model, 1000 topics, 20 replications.
+
+We now select the model with minimal perplexity (around 1,000 topics) and train LDA w. 20 replications. Again, we select by perplexity over the Target (news) corpus.
+
+```{r echo = T, eval = T}
+### ----------------------------------------------------------
+### --- LDA training: train the selected refCorpLDA_tdm_sparse
+### --- model: 1000 topics
+### --- number of replications: 20
+### ----------------------------------------------------------
+
+### --- Iterate: n_repl replications
+# - params
+# - number of replications:
+n_repl = 20
+nTops <- rep(1000, n_repl)
+
+# - initiate cluster:
+sfInit(parallel = TRUE, 
+       cpus = 7)
+# - export
+sfExport("nTops")
+sfExport("refCorpLDA_tdm_sparse")
+sfExport("targetCorpLDA_tdm_sparse")
+sfLibrary(text2vec)
+
+t1 <- Sys.time()
+print(paste0("Training starts:", t1))
+ldaModels <- sfClusterApplyLB(nTops,
+                              function(x) {
+                                # - define model:
+                                # - alpha:
+                                doc_topic_prior = 50/x
+                                # - beta:
+                                topic_word_prior = 1/x
+                                # - lda_model:
+                                lda_model <- text2vec:::LatentDirichletAllocation$new(n_topics = x,
+                                                                                      doc_topic_prior,
+                                                                                      topic_word_prior)
+                                # - train:
+                                doc_topic_distr <- lda_model$fit_transform(refCorpLDA_tdm_sparse,
+                                                                           n_iter = 1000,
+                                                                           convergence_tol = -1,
+                                                                           n_check_convergence = 25,
+                                                                           progressbar = FALSE)
+                                # - compute perplexity:
+                                new_doc_topic_distr = lda_model$transform(targetCorpLDA_tdm_sparse)
+                                perplexity <- text2vec:::perplexity(targetCorpLDA_tdm_sparse,
+                                                                    topic_word_distribution = lda_model$topic_word_distribution,
+                                                                    doc_topic_distribution = new_doc_topic_distr)
+                                
+                                # - outputs
+                                out <- list()
+                                out$lda_model <- lda_model
+                                out$doc_topic_distr <- doc_topic_distr
+                                out$new_doc_topic_distr <- new_doc_topic_distr
+                                out$perplexity <- perplexity
+                                return(out)
+                              })
+
+print(paste0("Training starts:", Sys.time()))
+print(paste0("Training took: ", Sys.time() - t1))
+
+# - store final models
+saveRDS(ldaModels, paste0(analyticsDir, 
+                          "Final_LDA_Models.rds"))
+
+# - store perplexities from the final model:
+final_modelFrame <- data.frame(model_index = 1:length(nTops), 
+                               topics = nTops,
+                               perplexity = sapply(ldaModels, function(x) {x$perplexity}),
+                               stringsAsFactors = F)
+write.csv(final_modelFrame, paste0(analyticsDir,
+                                   "final_model_Perplexities.csv"))
+
+# - stop cluster
+sfStop()
+
+### - final_modelFrame
+ggplot(final_modelFrame, aes(x = model_index,
+                             y = perplexity, 
+                             label = model_index)) +
+  geom_line(size = .25, color = "red", group = 1) +
+  geom_point(size = 1.5, color = "black") + 
+  geom_point(size = 1, color = "white") + 
+  geom_text_repel() + 
+  ggtitle("WarpLDA {text2vec}: 10 replications of the best (nTops=1000) LDA model") + 
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+
+# - select final model
+ldaModel <- ldaModels[[which.min(sapply(ldaModels, function(x) {x$perplexity}))]]
+rm(ldaModels)
+# - save final model
+saveRDS(ldaModel, 
+        paste0(analyticsDir, "Seletected_LDA_Model.Rds"))
+```
+
+
+***
+Goran S. Milovanović & Mike Page
+
+DataKolektiv, 2019.
+
+contact: datakolektiv@datakolektiv.com
+
+![](img/DK_Logo_100.png)
+
+***
+License: [GPLv3](http://www.gnu.org/licenses/gpl-3.0.txt)
+This Notebook is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+This Notebook is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+You should have received a copy of the GNU General Public License along with this Notebook. If not, see <http://www.gnu.org/licenses/>.
+
+***
+
+

@@ -1,0 +1,182 @@
+---
+title: Semantic Web Technologies and Wikidata from R
+author:
+- name: Goran S. Milovanović
+  affiliation: Wikimedia Deutschland, Data Scientist, DataKolektiv, Owner
+- name: Mike Page
+  affiliation: DataKolektiv, Junior Data Scientist
+date: "`r format(Sys.time(), '%d %B %Y')`"
+abstract: 
+output:
+  html_notebook:
+    code_folding: show
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+  html_document:
+    toc: yes
+    toc_depth: 5
+---
+
+![](img/DK_Logo_100.png)
+
+***
+### Notebook 01: Named Entity Recognition with {spacyr}
+**Feedback** should be send to `goran.milovanovic@datakolektiv.com`. 
+These notebooks accompany the MilanoR talk 2019/06/25.
+
+***
+
+In this Notebook we produce our `content_corpus` from the `{newsrivr}` collected documents in `00_newsrivr.nb.html`. We will then use {spacyr} R package to interface the `SpaCy` NER entitiy recognition procedures. Our goal is to recognize as many named entities in several categories across the documents in `content_corpus`. In the following notebooks we will then try to match the recognized entities against Wikidata concepts, acquire many features of these concepts from Wikidata (in Wikidata, they are called: *properties*), and thus enrich the data set for further information retrieval purposes. 
+
+### 0. Install spaCy
+
+Check out [Quanteda's GitHub](https://github.com/quanteda/spacyr): you can let R install {spacyr} w. `spacy_install()` in a conda environment separate from the one already existing or use your own environment.
+In any case, [Anaconda](https://www.anaconda.com/distribution/) must be installed on your system.
+For {spacyr}, of course: `devtools::install_github("quanteda/spacyr", build_vignettes = FALSE)` or `install.packages("spacyr")`
+
+
+### 1. Setup
+
+**Note.** The following chunks load packages, define the project directory tree and some constants.
+
+```{r echo = T}
+## - libraries
+library(pluralize)
+library(data.table)
+library(tidyverse)
+library(spacyr)
+library(kableExtra)
+library(DT)
+
+## - directories
+dataDir <- 'data/'
+analyticsDir <- 'analytics/'
+funDir <- 'functions/'
+```
+
+Constant `spaCy_keep`: we do not want to keep the entities from all [spaCy NER categories](https://spacy.io/api/annotation), just:
+
+* `PERSON`
+* `GPE` (Countries, cities, states)
+* `ORG`
+* `PRODUCT`
+
+```{r echo = T}
+## - parameters
+# - spaCy NER categories to keep:
+spaCy_keep <- c("GPE", "ORG", "PERSON", "PRODUCT")
+```
+
+### 2. Corpus obtained from {newsrivr}
+
+**Note.** The following chunks load the `content_corpus`, perform some initial (naive) clean-ups, check for duplicates, and initiate the tracking of essential statistics. The `.Rds` files found in `dataDir` (defined above) are company specific corpora obtained from the NewsRiver API via {newsrivr}.
+
+```{r echo = T}
+### --- Comment:
+# - Load the News text corpus: content_corpus
+# - heuristic:
+# - remove all documents with nchar(doc) < 500 characters
+# - ratio: probably not relevant
+
+### --- Corpus
+lF <- list.files(dataDir)
+lF <- lF[grepl(".rds", lF, ignore.case = T)]
+content_corpus <- lapply(lF, function(x) {
+  t <- readRDS(paste0(dataDir, x))
+  t$business <- gsub("_news.rds", "", x, fixed = T)
+  t
+})
+content_corpus <- rbindlist(content_corpus)
+
+## - clean up
+# - clean up data from short documents
+# - heuristic: remove docs w. nchar(doc) < 500
+# - probably not relevant
+w_less500 <- nchar(content_corpus$text)
+w_less500 <- which(w_less500 < 500)
+content_corpus <- content_corpus[-w_less500, ]
+
+# - Check for duplicates in content_corpus
+content_corpus <- content_corpus[!duplicated(content_corpus), ]
+
+# - add doc id
+content_corpus$doc_id <- seq(1:dim(content_corpus)[1])
+
+## - content_corpus_stats statistics
+content_corpus_stats <- list()
+content_corpus_stats$N_docs <- length(content_corpus$doc_id)
+# - store content_corpus
+write.csv(content_corpus, 
+          paste0(analyticsDir, "content_corpus.csv"))
+```
+
+### 3. NER w. spaCy
+
+**Note.** Initialize spaCy w. `spacy_initialize()`, perform NER with `spacy_extract_entity()`, and keep only the entities found in `spaCy_keep`. The `spacy_extract_entity()` function runs across the `content_corpus` data.frame and extracts all named entities it can recognize in it.
+
+```{r echo = T}
+# - utilize {spacyr} Named Entity Recognition
+# - to extract entities from the content_corpus
+
+# - Connect to the spaCy condaenv
+spacy_initialize()
+
+# - extract -> ner_frame
+ner_frame <- spacy_extract_entity(content_corpus)
+
+# - Finalize spacy
+spacy_finalize()
+
+# - keep only the spaCy_keep (see ## - parameters):
+ner_frame <- dplyr::filter(ner_frame, 
+                           ent_type %in% spaCy_keep)
+```
+
+### 4. Singularize all entities and produce `entity_frame`
+
+**Note.** The `entity_frame` data.frame is where we will track all recognized entities alongside the `doc_Id` of the respective document from the `content_corpus`. We will use the `singularize()` function from `{pluralize}` to transform all plural forms to singular forms: our experiments with Wikidata search shown that this preparatory step might be necessary for successful search across the Wikidata entities. **However**, note that this will also lead to a loss of some named entities (e.g. "Starbucks" becomes "Starbuck" and we hit a problem); the best solution would be to run both plural and singular forms against Wikidata, but we restrained from doing that for reasons of constrained computational resources that we need in the following phases of the project (e.g. running a huge number of LDA models to perform document-level entity-concept disambiguation against Wikidata).
+
+```{r echo = T}
+# - entities_frame: all extracted entities
+# - singularize from {pluralize}
+# - check for duplicates and maintain as a unique
+# - set of recognized entities to match against Wikidata
+entities_frame <- ner_frame %>% 
+  dplyr::select(doc_id, text)
+# - singularize entities_frame$text:
+entities_frame$text <- singularize(entities_frame$text)
+# - remove duplicates, if any:
+entities_frame <- entities_frame[!duplicated(entities_frame), ]
+# - remove ner_frame
+rm(ner_frame); gc()
+# - store entities_frame
+write.csv(entities_frame, 
+          paste0(analyticsDir, "entities_frame_01_spaCy_NER.csv"))
+```
+
+**Example.** A subset of `entity_frame`:
+
+```{r echo = T}
+datatable((entities_frame[runif(20, 1, dim(entities_frame)[1]), ]))
+```
+
+***
+Goran S. Milovanović & Mike Page
+
+DataKolektiv, 2019.
+
+contact: datakolektiv@datakolektiv.com
+
+![](img/DK_Logo_100.png)
+
+***
+License: [GPLv3](http://www.gnu.org/licenses/gpl-3.0.txt)
+This Notebook is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+This Notebook is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+You should have received a copy of the GNU General Public License along with this Notebook. If not, see <http://www.gnu.org/licenses/>.
+
+***
+
+
