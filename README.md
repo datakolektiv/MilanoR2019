@@ -5,12 +5,12 @@ MilanoR Meetup, June 25, 2019.
 
 The Rmarkdown notebooks in this repository accompany the MilanoR Meetup, 25 June 2019:
 
-Information Retrieval: 
-Semantic Web Technologies and Wikidata from R
+*Information Retrieval: 
+Semantic Web Technologies and Wikidata from R*
 
 Goran S. Milovanović, Phd
-Wikimedia Deutschland, Data Scientist for Wikidata
-DataKolektiv, Belgrade
+*Wikimedia Deutschland, Data Scientist for Wikidata*
+*DataKolektiv, Belgrade*
 
 The {newsrivr} package to interface the NEWSRIVER API from R, developed by Michael John Page, is also introduced in this Meetup.
 
