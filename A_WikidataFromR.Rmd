@@ -72,9 +72,10 @@ It is really a list:
 ```{r echo = T, eval = T}
 # - Retrieve the Wikidata item: Milano (Q490) 
 item_components <- sapply(item, names)
+item_components
 ```
 
-Type is `item`:
+`$type` is `item`:
 
 ```{r echo = T, eval = T}
 # - Retrieve the Wikidata item: Milano (Q490) 
@@ -639,9 +640,56 @@ head(backlinks, 100)
 
 ## 3. Accessing Wikidata from R: SPARQL
 
-### 1A. SPARQL via WDQS (Wikidata Query Service)
+### 3A. SPARQL via WDQS (Wikidata Query Service)
 
+```{r echo = T, eval = T}
+# - WDQS endPoint:
+endPointURL <- "https://query.wikidata.org/bigdata/namespace/wdq/sparql?format=json&query="
+# - query:
+# - NOTE. For the SELECT wikibase:label "magic", see:
+# - https://en.wikibooks.org/wiki/SPARQL/SERVICE_-_Label
+query <- 'SELECT ?item ?itemLabel WHERE {
+  ?item wdt:P31 wd:Q9143 .
+   SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+}'
+res <- GET(url = paste0(endPointURL, URLencode(query)))
+res$status_code
+```
 
+```{r echo = T, eval = T}
+# - decode:
+res <- rawToChar(res$content)
+substr(res, 1, 2000)
+```
+
+```{r echo = T, eval = T}
+# - from JSON:
+res <- fromJSON(res)
+class(res)
+```
+
+```{r echo = T, eval = T}
+items <- res$results$bindings$item
+labels <- res$results$bindings$itemLabel
+```
+
+```{r echo = T, eval = T}
+# - inspect result:
+head(items)
+```
+
+```{r echo = T, eval = T}
+# - inspect result:
+head(labels)
+```
+
+```{r echo = T, eval = T}
+# - data.frame:
+programmingLanguages <- data.frame(items = gsub("http://www.wikidata.org/entity/", "", items$value), 
+                                   labels = labels$value, 
+                                   stringsAsFactors = F)
+head(programmingLanguages, 10)
+```
 
 ***
 Goran S. Milovanović & Mike Page
